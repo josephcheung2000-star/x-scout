@@ -4,6 +4,7 @@ name: x-scout-pipeline
 on:
   schedule:
     - cron: "*/10 * * * *"
+    - cron: "7,37 * * * *"      # second, sparser entry in case the 10-min one is being dropped
   workflow_dispatch:
     inputs:
       job:
