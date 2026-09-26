@@ -592,6 +592,10 @@ def _num(v):
     try: return float(v)
     except Exception: return 0.0
 
+def _clip(t, n):
+    t = " ".join(str(t or "").split())
+    return t if len(t) <= n else t[:n].rsplit(" ", 1)[0].rstrip(",;:") + "…"
+
 def _list(v):
     return v if isinstance(v, list) else ([] if v is None else [v])
 
@@ -677,10 +681,11 @@ def digest(send=False, if_due=False):
     if hist and len(exp) < RUNS_PER_DAY:
         lines.append(f"(run history started {_jst(first).strftime('%m-%d %H:%M')} JST - partial day)")
     lines.append(f"Runs {len(got & exp) if exp else len(runs)}/{len(exp) or RUNS_PER_DAY} ({full} full analysis) | X posts read {posts} | source items {items}")
-    lines.append(f"Leads logged {leads} | alerts sent {len(alerts)}" + (f" ({', '.join(alerts)})" if alerts else ""))
+    new_leads = sum(1 for l in L if dt(l.get("first_seen", "")) and (t - dt(l["first_seen"])).total_seconds() < 81000)
+    lines.append(f"Leads logged {leads} ({new_leads} new, the rest re-mentions of tracked leads) | alerts sent {len(alerts)}" + (f" ({', '.join(alerts)})" if alerts else ""))
     if near:
         lines.append("Near-misses (not alerted):")
-        lines += [f"- {m.get('asset')} {m.get('score')}/10: {str(m.get('why') or '')[:110]}" for m in near[:3]]
+        lines += [f"- {m.get('asset')} {_num(m.get('score')):g}/10: {_clip(m.get('why'), 150)}" for m in near[:3]]
     def ret(l): return (l["last"] / l["entry"] - 1) * (-1 if l.get("direction") == "short" else 1)
     o = [l for l in L if l.get("status") == "open" and l.get("entry") and l.get("last")]
     mv = sorted([l for l in o if abs(ret(l)) >= 0.005], key=lambda l: -abs(ret(l)))[:4]

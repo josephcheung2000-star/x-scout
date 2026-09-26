@@ -19,7 +19,7 @@ FOLDER = os.environ.get("XS_FOLDER", "11yC1KUtWZTUYoZIEuU_AoT8bFhomq6qo")   # Dr
 JST = datetime.timezone(datetime.timedelta(hours=9))
 SLOT_HOURS = [2, 5, 8, 11, 14, 17, 20, 23]            # Claude runs at HH:45 JST
 PREP_WINDOW = (3, 45)                                  # prep between 45 and 3 minutes before the slot
-PART_CHARS = 90000
+PART_CHARS = 28000                                     # the Claude run's Drive reader truncates long docs; keep parts small
 HEALTH = "health.json"                                 # committed by the workflow: once-per-day notice memory
 ERRORS = []
 SLOT_RX = re.compile(r"\d{4}-\d{2}-\d{2} \d{4}")
@@ -239,10 +239,16 @@ def prep(d, slot):
                      f"{one_line(p.get('text'), 700)} | {p.get('url')}")
     L += ["", "END OF INPUT"]
     text = "\n".join(L)
-    parts = [text[i:i + PART_CHARS] for i in range(0, len(text), PART_CHARS)] or [text]
+    parts, cur = [], ""
+    for line in L:                                             # split on line boundaries, never mid-post
+        line = line[:PART_CHARS - 200]
+        if cur and len(cur) + len(line) + 1 > PART_CHARS:
+            parts.append(cur); cur = ""
+        cur += line + "\n"
+    parts.append(cur)
     for i, part in enumerate(parts):
         title = name if len(parts) == 1 else f"{name} part {i + 1} of {len(parts)}"
-        create_doc(d, title, part)
+        create_doc(d, title, part + f"--- END OF PART {i + 1} OF {len(parts)} ---\n")
     print(f"input doc: {name}, {len(chosen)} posts, {len(text)} chars, {len(parts)} part(s)")
     for f in files:                                            # consumed only once the input doc exists
         rename(d, f, "USED " + f["name"])
