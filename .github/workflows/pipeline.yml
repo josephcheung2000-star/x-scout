@@ -31,21 +31,8 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: pip install -q google-api-python-client google-auth
-      - name: Is a prep due?
-        id: need
-        run: |
-          if [ "$JOB" = "prep" ]; then echo "prep=yes" >> "$GITHUB_OUTPUT"; else echo "prep=$(python pipeline.py need-prep | tail -1)" >> "$GITHUB_OUTPUT"; fi
-      - name: Install Chromium (only before a prep)
-        if: steps.need.outputs.prep == 'yes'
-        run: |
-          pip install -q playwright
-          python -m playwright install --with-deps chromium > /dev/null
-          sudo apt-get install -y -q xvfb > /dev/null
       - name: Run pipeline
-        env:
-          XS_CHANNEL: chrome
-          XS_HEADFUL: "1"
-        run: if [ "${{ steps.need.outputs.prep }}" = "yes" ]; then xvfb-run -a python pipeline.py "$JOB"; else python pipeline.py "$JOB"; fi
+        run: python pipeline.py "$JOB"
       - name: Save once-a-day notice memory
         if: always()
         run: |

@@ -3,7 +3,7 @@
 
 Every 10 minutes the workflow runs `python3 pipeline.py tick`, which does two things:
   PREP  (once per slot, 5-40 min before each Claude run at HH:45 JST, HH = 2,5,...,23):
-        ledger pull -> poll-replies -> update prices/paper -> X fetch -> sources -> triage
+        ledger pull -> poll-replies -> update prices/paper -> X posts (from the Mac feeder via Drive) -> sources -> triage
         -> write Google Doc "XS-IN <slot>" (one or more parts) into the X-scout Drive folder -> ledger push
   APPLY (whenever Claude has left a "XS-OUT <slot>" JSON file in the folder):
         ledger pull -> add leads -> send alerts (with Took/Skipped buttons) -> playbook -> runlog
@@ -18,7 +18,7 @@ from googleapiclient.http import MediaInMemoryUpload
 FOLDER = os.environ.get("XS_FOLDER", "11yC1KUtWZTUYoZIEuU_AoT8bFhomq6qo")   # Drive "X-scout" (info@)
 JST = datetime.timezone(datetime.timedelta(hours=9))
 SLOT_HOURS = [2, 5, 8, 11, 14, 17, 20, 23]            # Claude runs at HH:45 JST
-PREP_WINDOW = (5, 40)                                  # prep between 40 and 5 minutes before the slot
+PREP_WINDOW = (5, 30)                                  # prep between 30 and 5 minutes before the slot
 PART_CHARS = 90000
 HEALTH = "health.json"                                 # committed by the workflow: once-per-day notice memory
 ERRORS = []
@@ -136,17 +136,44 @@ def prep(d, slot):
         if rc != 0:
             err(f"ledger {cmd[0]} failed")
 
-    # X fetch (Playwright chromium is installed by the workflow before prep)
+    # X posts come from the Mac feeder (X shows cloud/datacenter IPs a bot wall): use every unused
+    # XS-POSTS file from the last 3.5 h, newest status wins, posts merged and de-duplicated.
     for f in ("posts.json", "sources.json", "triage.json"):
         if os.path.exists(f):
             os.remove(f)
-    rc, out = sh(["xfetch_cloud.py", "300", "3.25"], timeout=660, env_extra={"XS_SCROLLS": "70"})
-    x = load_json("posts.json", {}).get("status") or {"ok": False, "errors": [f"fetch exit {rc}"]}
-    if not x.get("ok") or any("not logged in" in str(e) for e in x.get("errors", [])):
-        err("X fetch failed or not logged in")
-        if health_once("fetch_alert"):
-            notify("fetch", "not logged in or no timeline" if x.get("errors") else f"exit {rc}")
-    print(f"x: ok={x.get('ok')} captured={x.get('captured')} kept={x.get('kept')}")
+    x = {"ok": False, "errors": ["no X posts from the Mac feeder in the last 3.5 h (Mac asleep or offline?)"]}
+    cutoff = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=3.5)).strftime("%Y-%m-%dT%H:%M:%S")
+    files = [f for f in list_files(d, "XS-POSTS", f"and createdTime > '{cutoff}'") if f["name"].startswith("XS-POSTS")]
+    posts_all, seen_ids = [], set()
+    for f in reversed(files):                                  # newest first
+        try:
+            data = json.loads(read_file(d, f))
+        except Exception:
+            err("unreadable XS-POSTS file")
+            continue
+        if f is files[-1]:
+            x = data.get("status") or x
+        for p in data.get("posts") or []:
+            if isinstance(p, dict) and p.get("id") and p["id"] not in seen_ids:
+                seen_ids.add(p["id"]); posts_all.append(p)
+        rename(d, f, "USED " + f["name"])
+    if files:
+        x = dict(x, kept=len(posts_all), files=len(files))
+    json.dump({"status": x, "posts": posts_all}, open("posts.json", "w"), ensure_ascii=False)
+    h = load_json(HEALTH, {})
+    if x.get("ok"):
+        h["last_x_ok"] = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="minutes")
+        json.dump(h, open(HEALTH, "w"), indent=1)
+    else:
+        err("no X posts this slot" if not files else "Mac X fetch failed")
+        last = h.get("last_x_ok")
+        stale = (not last) or (datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromisoformat(last)).total_seconds() > 12 * 3600
+        if files and any(k in json.dumps(x).lower() for k in ("401", "403", "auth", "cookie", "login")):
+            if health_once("fetch_alert"):
+                notify("fetch", "the Mac fetcher could not log in")
+        elif stale and health_once("x_missing"):
+            notify("other", "no X posts from the Mac feeder for 12+ hours - is the Mac asleep or offline")
+    print(f"x: ok={x.get('ok')} files={len(files)} kept={len(posts_all)}")
 
     rc, out = sh(["sources.py", "3.5"], timeout=300)
     src = load_json("sources.json", {})
@@ -304,7 +331,7 @@ def apply(d):
 def tidy(d):
     """Trash pipeline files older than 7 days (the human-readable run logs are kept)."""
     cutoff = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S")
-    for key in ("XS-IN", "XS-OUT"):
+    for key in ("XS-IN", "XS-OUT", "XS-POSTS"):
         for f in list_files(d, key, f"and createdTime < '{cutoff}'"):
             d.files().update(fileId=f["id"], body={"trashed": True}).execute()
 
