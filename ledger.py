@@ -96,6 +96,15 @@ def push():
         print("PUSH REFUSED: state.json did not come from a successful pull"); sys.exit(1)
     if len(s.get("leads", [])) < s.get("_pulled_leads", 0):
         print("PUSH REFUSED: fewer leads than were pulled - state looks truncated"); sys.exit(1)
+    try:  # optimistic lock: the pinned state must still be the version we pulled
+        cap = ((tg("getChat", chat_id=STORE)["result"].get("pinned_message") or {}).get("caption") or "")
+        m = re.search(r"state v(\d+)", cap)
+        if m and int(m.group(1)) != s["_pulled"]:
+            print(f"PUSH REFUSED: the pinned state is now v{m.group(1)}, but this copy was pulled at v{s['_pulled']} - pull again"); sys.exit(1)
+    except SystemExit:
+        raise
+    except Exception:
+        pass
     s["version"] = s["_pulled"] + 1; s["updated"] = now().isoformat(timespec="minutes")
     save(s)
     boundary = "xscout" + str(int(time.time()))
@@ -605,7 +614,12 @@ def runlog(path):
         elif isinstance(m, str) and m.strip(): nm.append({"asset": m.split()[0], "score": 0, "why": red(m)[:160]})
     r["near_misses"] = nm
     r["alerts_sent"] = [str(a) for a in _list(r.get("alerts_sent"))]
-    s = load(); t = now(); r["at"] = t.isoformat(timespec="minutes"); r["slot"] = _slot(t)
+    s = load(); t = now(); r["at"] = t.isoformat(timespec="minutes")
+    try:  # the pipeline passes the Claude slot time, so a late apply is filed under the right slot
+        st = datetime.fromisoformat(str(r.pop("slot_at")))
+        r["slot"] = _slot(st if st.tzinfo else st.replace(tzinfo=timezone.utc))
+    except Exception:
+        r["slot"] = _slot(t)
     runs = [x for x in s.get("runs", []) if x.get("slot") != r["slot"]]  # a retried run replaces its slot
     runs.append(r); s["runs"] = runs[-300:]
     save(s); print(f"RUNLOG: recorded run at {r['at']} slot {r['slot']} ({len(s['runs'])} in history)")

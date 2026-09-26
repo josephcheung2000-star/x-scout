@@ -2,7 +2,7 @@
 """X-scout pipeline on GitHub Actions. All credentialed work happens here, never in the Claude run.
 
 Every 10 minutes the workflow runs `python3 pipeline.py tick`, which does two things:
-  PREP  (once per slot, 5-40 min before each Claude run at HH:45 JST, HH = 2,5,...,23):
+  PREP  (once per slot, 3-45 min before each Claude run at HH:45 JST, HH = 2,5,...,23):
         ledger pull -> poll-replies -> update prices/paper -> X posts (from the Mac feeder via Drive) -> sources -> triage
         -> write Google Doc "XS-IN <slot>" (one or more parts) into the X-scout Drive folder -> ledger push
   APPLY (whenever Claude has left a "XS-OUT <slot>" JSON file in the folder):
@@ -18,10 +18,11 @@ from googleapiclient.http import MediaInMemoryUpload
 FOLDER = os.environ.get("XS_FOLDER", "11yC1KUtWZTUYoZIEuU_AoT8bFhomq6qo")   # Drive "X-scout" (info@)
 JST = datetime.timezone(datetime.timedelta(hours=9))
 SLOT_HOURS = [2, 5, 8, 11, 14, 17, 20, 23]            # Claude runs at HH:45 JST
-PREP_WINDOW = (5, 30)                                  # prep between 30 and 5 minutes before the slot
+PREP_WINDOW = (3, 45)                                  # prep between 45 and 3 minutes before the slot
 PART_CHARS = 90000
 HEALTH = "health.json"                                 # committed by the workflow: once-per-day notice memory
 ERRORS = []
+SLOT_RX = re.compile(r"\d{4}-\d{2}-\d{2} \d{4}")
 
 
 def jst_now():
@@ -151,12 +152,12 @@ def prep(d, slot):
         except Exception:
             err("unreadable XS-POSTS file")
             continue
-        if f is files[-1]:
-            x = data.get("status") or x
+        st = data.get("status") if isinstance(data.get("status"), dict) else {}
+        if f is files[-1] or (st.get("ok") and not x.get("ok")):
+            x = st or x
         for p in data.get("posts") or []:
             if isinstance(p, dict) and p.get("id") and p["id"] not in seen_ids:
                 seen_ids.add(p["id"]); posts_all.append(p)
-        rename(d, f, "USED " + f["name"])
     if files:
         x = dict(x, kept=len(posts_all), files=len(files))
     json.dump({"status": x, "posts": posts_all}, open("posts.json", "w"), ensure_ascii=False)
@@ -243,6 +244,8 @@ def prep(d, slot):
         title = name if len(parts) == 1 else f"{name} part {i + 1} of {len(parts)}"
         create_doc(d, title, part)
     print(f"input doc: {name}, {len(chosen)} posts, {len(text)} chars, {len(parts)} part(s)")
+    for f in files:                                            # consumed only once the input doc exists
+        rename(d, f, "USED " + f["name"])
 
     rc, out = sh(["ledger.py", "push"], timeout=120)
     if rc != 0:
@@ -250,12 +253,13 @@ def prep(d, slot):
         rc, out = sh(["ledger.py", "push"], timeout=120)
     if rc != 0:
         err("ledger push after prep failed")
+        return False
     return True
 
 
 # ---------------------------------------------------------------- APPLY
 def apply(d):
-    outs = [f for f in list_files(d, "XS-OUT") if not f["name"].startswith(("DONE", "BAD"))]
+    outs = [f for f in list_files(d, "XS-OUT") if f["name"].startswith("XS-OUT")]
     if not outs:
         print("apply: nothing to do")
         return
@@ -265,17 +269,24 @@ def apply(d):
         if health_once("pull_alert"):
             notify("pull")
         return
+    finished, digest_due = [], False
     for f in outs:
         try:
             o = json.loads(read_file(d, f))
             assert isinstance(o, dict)
+            m = SLOT_RX.search(str(o.get("slot") or "")) or SLOT_RX.search(f["name"])
+            slot = m.group(0)
         except Exception:
-            err(f"unreadable output file")
+            err("unreadable output file")
             rename(d, f, "BAD " + f["name"])
             if health_once("bad_out"):
                 notify("other", "the Claude run wrote an output file the pipeline could not read")
             continue
-        slot = str(o.get("slot") or f["name"].replace("XS-OUT", "").strip())
+        s = load_json("state.json", {})
+        if slot in (s.get("applied_slots") or []):
+            print("duplicate output skipped")
+            finished.append((f, "DUPLICATE"))
+            continue
         run = o.get("run") if isinstance(o.get("run"), dict) else {}
         run_errors = [str(e) for e in (run.get("errors") or [])]
         leads = [l for l in (o.get("leads") or []) if isinstance(l, dict) and l.get("asset")]
@@ -285,22 +296,22 @@ def apply(d):
             if rc != 0:
                 run_errors.append("ledger add failed")
         sent = []
-        for a in (o.get("alerts") or [])[:2]:
+        for i, a in enumerate((o.get("alerts") or [])[:2]):
             if not isinstance(a, dict) or not a.get("asset") or not a.get("text"):
                 continue
-            asset = re.sub(r"[^A-Za-z0-9._-]", "", str(a["asset"]))[:20] or "X"
-            open(f"alert_{asset}.txt", "w").write(str(a["text"]))
-            json.dump(a.get("plan") or {}, open(f"plan_{asset}.json", "w"))
-            rc, out = sh(["ledger.py", "send-alert", f"alert_{asset}.txt", asset, f"plan_{asset}.json"], timeout=120)
-            if rc == 1:
+            asset = str(a["asset"]).strip()
+            open(f"alert_{i}.txt", "w").write(str(a["text"]))
+            json.dump(a.get("plan") or {}, open(f"plan_{i}.json", "w"))
+            rc, out = sh(["ledger.py", "send-alert", f"alert_{i}.txt", asset, f"plan_{i}.json"], timeout=120)
+            if rc == 1 and "no open lead" not in out:
                 time.sleep(20)
-                rc, out = sh(["ledger.py", "send-alert", f"alert_{asset}.txt", asset, f"plan_{asset}.json"], timeout=120)
+                rc, out = sh(["ledger.py", "send-alert", f"alert_{i}.txt", asset, f"plan_{i}.json"], timeout=120)
             if rc in (0, 2):
                 sent.append(asset)
                 if rc == 2:
                     run_errors.append(f"alert {asset} only partly sent")
             else:
-                run_errors.append(f"alert {asset} could not be sent")
+                run_errors.append(f"alert {asset} could not be sent" + (" (no matching lead)" if "no open lead" in out else ""))
         if isinstance(o.get("playbook"), str) and o["playbook"].strip():
             open("playbook.md", "w").write(o["playbook"])
             rc, out = sh(["ledger.py", "set-playbook", "playbook.md"], timeout=60)
@@ -308,24 +319,37 @@ def apply(d):
                 run_errors.append("set-playbook failed")
         s = load_json("state.json", {})
         pend = (s.get("pending_prep") or {}).pop(slot, {}) if isinstance(s.get("pending_prep"), dict) else {}
+        s["applied_slots"] = ((s.get("applied_slots") or []) + [slot])[-60:]
         json.dump(s, open("state.json", "w"), ensure_ascii=False, indent=1)
+        slot_at = datetime.datetime.strptime(slot, "%Y-%m-%d %H%M").replace(tzinfo=JST).isoformat()
         rec = {"mode": run.get("mode") or pend.get("mode") or "full", "x": pend.get("x") or {"ok": None},
                "sources": pend.get("sources") or {}, "source_errors": pend.get("source_errors") or [],
                "posts_read": run.get("posts_read", 0), "items_read": run.get("items_read", 0),
                "leads_logged": len(leads), "alerts_sent": sent, "near_misses": run.get("near_misses") or [],
-               "errors": (pend.get("prep_errors") or []) + run_errors}
+               "errors": (pend.get("prep_errors") or []) + run_errors, "slot_at": slot_at}
         json.dump(rec, open("run.json", "w"), ensure_ascii=False)
         sh(["ledger.py", "runlog", "run.json"], timeout=60)
-        rename(d, f, "DONE " + f["name"])
+        finished.append((f, "DONE"))
+        digest_due = digest_due or int(slot[-4:-2]) >= 20
         print(f"applied output for slot {slot}: {len(leads)} leads, {len(sent)} alert(s)")
-    rc, out = sh(["ledger.py", "digest", "--if-due"], timeout=120)
-    print("digest:", "sent" if "DIGEST: sent" in out else "not due / not sent")
+    h = jst_now().hour
+    if digest_due or h >= 23 or h < 3:            # the digest waits for the 20:45 run (23:45 run or later retries)
+        rc, out = sh(["ledger.py", "digest", "--if-due"], timeout=120)
+        print("digest:", "sent" if "DIGEST: sent" in out else "not due / not sent")
     rc, out = sh(["ledger.py", "push"], timeout=120)
     if rc != 0:
         time.sleep(30)
         rc, out = sh(["ledger.py", "push"], timeout=120)
     if rc != 0:
+        # alerts may already be out, so never re-apply: mark the files and say so once a day
         err("ledger push after apply failed")
+        for f, tag in finished:
+            rename(d, f, "NOPUSH " + f["name"])
+        if finished and health_once("apply_push"):
+            notify("other", "results of a scout run could not be saved to the ledger")
+        return
+    for f, tag in finished:
+        rename(d, f, tag + " " + f["name"])
 
 
 def tidy(d):
@@ -349,11 +373,12 @@ def main():
     if mode == "need-prep":                                # workflow asks first, so Chromium is installed only when needed
         print("yes" if want_prep else "no")
         return
+    prep_ok = True
     if want_prep:
-        prep(d, slot)
-    if mode in ("tick", "apply"):
+        prep_ok = prep(d, slot)
+    if mode in ("tick", "apply") and prep_ok:     # never apply on top of a prep whose push failed
         apply(d)
-    if now.hour == 4 and now.minute < 10:
+    if now.hour >= 4 and health_once("tidy"):
         try:
             tidy(d)
         except Exception:
