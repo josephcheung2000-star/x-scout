@@ -169,7 +169,10 @@ def stock_prices(tickers):
 _PM = {}
 def _poly_market(slug):
     if slug not in _PM:
-        d = http(f"https://gamma-api.polymarket.com/markets?slug={urllib.parse.quote(str(slug))}", headers=UA, timeout=20)
+        q = urllib.parse.quote(str(slug))
+        d = http(f"https://gamma-api.polymarket.com/markets?slug={q}", headers=UA, timeout=20)
+        if not (isinstance(d, list) and d):                  # resolved markets only come back with closed=true
+            d = http(f"https://gamma-api.polymarket.com/markets?slug={q}&closed=true", headers=UA, timeout=20)
         _PM[slug] = d[0] if isinstance(d, list) and d else None
     return _PM[slug]
 
@@ -190,7 +193,7 @@ def poly_prices(leads):
                 m = _poly_market(l["market_slug"]); i = _pm_index(m, l.get("outcome")) if m else None
                 if i is not None:
                     p = float(json.loads(m.get("outcomePrices") or "[]")[i])
-                    if p > 0: out[_pm_key(l)] = p
+                    if p >= 0: out[_pm_key(l)] = p     # 0 is a real price once a market resolves against the outcome
                 break
             except Exception:
                 _PM.pop(l["market_slug"], None); time.sleep(3)
@@ -260,11 +263,12 @@ def add(path):
             x = recent[0]
             x.setdefault("mentions", []).append({"at": t.isoformat(timespec="minutes"), "score": l.get("score"),
                                                   "alerted": bool(l.get("alerted")), "handles": l.get("handles", [])})
-            x["max_score"] = max(x.get("max_score", x["score"]), l.get("score") or 0)
+            x["max_score"] = max(_num(x.get("max_score") or x.get("score")), _num(l.get("score")))
             x["alerted"] = x["alerted"] or bool(l.get("alerted")); merged += 1; continue
         p, b = px(l, cp, sp)
         s["leads"].append({**{k: l.get(k) for k in LEAD_KEYS if l.get(k) is not None},
-            "id": f"{key}-{t.strftime('%Y%m%d%H%M')}", "alerted": bool(l.get("alerted")), "max_score": l.get("score"),
+            "score": _num(l.get("score")),
+            "id": f"{key}-{t.strftime('%Y%m%d%H%M')}", "alerted": bool(l.get("alerted")), "max_score": _num(l.get("score")),
             "first_seen": t.isoformat(timespec="minutes"), "entry": p, "bench_entry": b,
             "bench": BENCH.get(l.get("kind")),
             "status": "open" if p else "untracked", "cp": {}, "mfe": 0.0, "mae": 0.0, "last": p, "last_at": None})
@@ -291,7 +295,7 @@ def update():
     cp, sp = price_map(open_); t = now(); filled = []
     for l in open_:
         p, b = px(l, cp, sp)
-        if not p or not l.get("entry"): continue
+        if p is None or not l.get("entry"): continue
         sign = -1 if l.get("direction") == "short" else 1
         r = sign * (p / l["entry"] - 1)
         l["mfe"] = round(max(l.get("mfe", 0), r), 4); l["mae"] = round(min(l.get("mae", 0), r), 4)
@@ -317,8 +321,8 @@ def _ev_track(l, r, age_d, t):
     iso = t.isoformat(timespec="minutes")
     if r <= -st / 100: l["ev_outcome"], l["ev_exit"], l["ev_how"] = 0, -st / 100, "stop"
     elif r >= tg_ / 100: l["ev_outcome"], l["ev_exit"], l["ev_how"] = 1, tg_ / 100, "target"
-    elif age_d >= (_num(l.get("horizon_days")) or 14):
-        l["ev_outcome"], l["ev_exit"], l["ev_how"] = (1 if r > 0 else 0), round(r, 4), "horizon"
+    elif age_d >= (_num(l.get("horizon_days")) or 14):             # neither level reached: p_win's event did not happen
+        l["ev_outcome"], l["ev_exit"], l["ev_how"] = 0, round(r, 4), "horizon"
     else: return
     l["ev_resolved_at"] = iso
     l["ev_exit_net"] = round(l["ev_exit"] - _cost_rt(l, days=min(age_d, _num(l.get("horizon_days")) or 14)), 4)
@@ -390,8 +394,8 @@ def brief():
     lines = [f"Ledger: {len(L)} leads total, {len(o)} open, playbook {'set' if s.get('playbook') else 'empty'}"]
     for l in sorted(o, key=lambda l: l["first_seen"], reverse=True)[:12]:
         r = (l["last"] / l["entry"] - 1) * (-1 if l.get("direction") == "short" else 1) if l.get("entry") and l.get("last") else None
-        lines.append(f"- {l['asset']} s{l['score']}{' ALERTED' if l['alerted'] else ''} since {l['first_seen'][:16]} "
-                     f"now {r:+.1%}" if r is not None else f"- {l['asset']} s{l['score']} (no price)")
+        lines.append(f"- {l['asset']} s{l.get('score')}{' ALERTED' if l.get('alerted') else ''} since {l['first_seen'][:16]} "
+                     f"now {r:+.1%}" if r is not None else f"- {l['asset']} s{l.get('score')} (no price)")
     a7 = [((l.get("cp") or {}).get("7d") or {}).get("excess") for l in L if l.get("alerted")]
     a7 = [x for x in a7 if x is not None]
     if a7: lines.append(f"Alert track record: n={len(a7)} 7d median excess {statistics.median(a7):+.1%}, hit {sum(x>0 for x in a7)/len(a7):.0%}")
@@ -548,7 +552,8 @@ def _candles(l, since):
         try:
             m = _poly_market(l["market_slug"]); i = _pm_index(m, l.get("outcome"))
             tok = json.loads(m.get("clobTokenIds") or "[]")[i]
-            d = http(f"https://clob.polymarket.com/prices-history?market={tok}&startTs={int(since)}&endTs={int(time.time())}&fidelity=60", headers=UA)
+            t1 = int(time.time()); t0 = max(int(since), t1 - 13 * 86400)   # the endpoint rejects ranges over ~14 days
+            d = http(f"https://clob.polymarket.com/prices-history?market={tok}&startTs={t0}&endTs={t1}&fidelity=60", headers=UA)
             out = [(float(h["t"]), float(h["p"]), float(h["p"]), float(h["p"]), float(h["p"])) for h in d.get("history", [])]
         except Exception:
             return None
@@ -734,6 +739,7 @@ def handle_scores(K=5):
         ex = ((l.get("cp") or {}).get("7d") or {}).get("excess") if isinstance(l.get("cp"), dict) else None
         if isinstance(ex, (int, float)): rows.append((l, ex))
     if not rows: print("Handle track records: no 7-day results yet - every account has weight 0"); return
+    rows = [(l, max(-1.0, min(1.0, ex))) for l, ex in rows]          # clip: Polymarket share returns can be several 100%
     base_hit = sum(ex > 0 for _, ex in rows) / len(rows); base_mean = statistics.mean(ex for _, ex in rows)
     per = {}
     for l, ex in rows:

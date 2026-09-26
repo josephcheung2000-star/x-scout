@@ -20,7 +20,7 @@ SF = "state.json"
 UTC = timezone.utc
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0 Safari/537.36"
 KINDS = ("crypto", "stock", "commodity", "polymarket")
-KEEP_DAYS, ROLL_DAYS, LOOKBACK_H, CAP_PER_KIND = 60, 14, 7 * 24, 100
+KEEP_DAYS, ROLL_DAYS, LOOKBACK_H, CAP_PER_KIND = 21, 14, 7 * 24, 50
 COMMOD = {  # Yahoo symbol -> names a lead might use
     "GC=F": ("GOLD", "XAU", "XAUUSD", "PAXG", "XAUT"), "SI=F": ("SILVER", "XAG", "XAGUSD"), "HG=F": ("COPPER",),
     "PL=F": ("PLATINUM", "XPT"), "CL=F": ("WTI", "OIL", "CRUDE", "USOIL", "CRUDEOIL"), "BZ=F": ("BRENT", "UKOIL"),
@@ -223,16 +223,18 @@ def dir_ok(direction, chg):
 
 def match_all(movers, leads):
     for mv in movers:
-        end = mv["_end"]; lo = end - timedelta(hours=LOOKBACK_H)
+        end = mv["_end"]; wh = {"7d": 168}.get(str(mv.get("window")), 24)
+        lo = end - timedelta(hours=wh + LOOKBACK_H)
+        latest = end - timedelta(hours=wh / 2)          # "flagged beforehand": seen before the move was half over
         hits = []
         for l in leads:
             if not isinstance(l, dict) or not matches(l, mv): continue
-            ev = [e for e in events(l) if lo <= e[0] <= end]
+            ev = [e for e in events(l) if lo <= e[0] <= latest]
             if not ev: continue
             first = pdt(l.get("first_seen")) or min(e[0] for e in ev)
             sc = max([e[1] for e in ev if e[1] is not None] or [num(l.get("max_score")) or num(l.get("score")) or 0])
             hits.append({"lid": lead_id(l), "score": sc, "alerted": any(e[2] for e in ev) or bool(l.get("alerted")),
-                         "dir_ok": dir_ok(l.get("direction"), mv["chg_pct"]), "hours": (end - min(first, *[e[0] for e in ev])).total_seconds() / 3600})
+                         "dir_ok": dir_ok(l.get("direction"), -mv["chg_pct"] if (l.get("kind") == "polymarket" and str(l.get("outcome") or "yes").strip().lower() != "yes") else mv["chg_pct"]), "hours": (end - min(first, *[e[0] for e in ev])).total_seconds() / 3600})
         best = max(hits, key=lambda h: (h["score"], h["hours"])) if hits else None
         mv.update({"caught": bool(hits), "best_score": best and best["score"], "alerted": bool(hits) and any(h["alerted"] for h in hits),
                    "dir_ok": best and best["dir_ok"], "lead_hours_before": best and round(best["hours"], 1),

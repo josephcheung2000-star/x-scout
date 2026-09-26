@@ -281,6 +281,7 @@ def prep(d, slot):
             cap = len(items) if k == "commodities" else S2_PER_KEY
             for it in items[:cap]:
                 rest = {a: b for a, b in it.items() if a not in S2_DROP and b not in (None, "", [], {})}
+                rest = dict(sorted(rest.items(), key=lambda kv: isinstance(kv[1], (list, dict))))   # scalars first: the line is clipped
                 L.append(one_line(f"{k}: {it.get('title')} | {it.get('url')} | {json.dumps(rest, ensure_ascii=False, default=str)}", 420))
             if len(items) > cap:
                 L.append(f"{k}: (+{len(items) - cap} more not shown)")
@@ -328,9 +329,12 @@ def priors_text():
             continue
         ci = v.get("ci95") or [None, None]
         med = v.get("median_excess_7d", v.get("median"))
+        pts = "prob" in str(v.get("units", "")).lower() or k.startswith("polymarket")
+        f = (lambda x: f"{float(x) * 100:+.1f} pts") if pts else (lambda x: f"{float(x):+.1%}")
+        adj = v.get("score_adj")
         try:
-            out.append(f"{k}: n={v.get('n')} {v.get('horizon', '7d')} median excess {float(med):+.1%}, hit {float(v.get('hit_rate') or 0):.0%}, "
-                       f"CI95 [{float(ci[0]):+.1%}, {float(ci[1]):+.1%}], score adj {v.get('score_adj', 0):+}{' (weak)' if v.get('weak') else ''} - {one_line(v.get('note'), 140)}")
+            out.append(f"{k}: n={v.get('n')} {v.get('horizon', '7d')} median {'move' if pts else 'excess'} {f(med)}, share of longs that won {float(v.get('hit_rate') or 0):.0%}, "
+                       f"CI95 [{f(ci[0])}, {f(ci[1])}], score adj {('%+d' % adj) if isinstance(adj, (int, float)) else 'n/a (see PLAYBOOK)'}{' (weak)' if v.get('weak') else ''} - {one_line(v.get('note'), 140)}")
         except Exception:
             out.append(f"{k}: {one_line(json.dumps(v), 200)}")
     return "\n".join(out) or "(no priors)"

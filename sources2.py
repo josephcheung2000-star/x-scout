@@ -49,7 +49,7 @@ DEADLINE = T0 + 170                       # hard cap for the whole run (the work
 H = float(sys.argv[1]) if len(sys.argv) > 1 and re.fullmatch(r"[\d.]+", sys.argv[1]) else 3.5
 NOW = datetime.now(timezone.utc)
 UTC, NY, SEOUL = timezone.utc, ZoneInfo("America/New_York"), ZoneInfo("Asia/Seoul")
-UA = "x-scout research josephcheung2000@gmail.com"
+UA = "Mozilla/5.0 (compatible; x-scout-research/1.0)"
 BUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 SF, CAP = "state.json", 5000
 ERRORS = []
@@ -657,7 +657,7 @@ def save_state():
         cur = load_state()                                # re-read: only src2_seen is ours, keep everything else as on disk
         if cur is None: return
         seen = cur.get("src2_seen") if isinstance(cur.get("src2_seen"), dict) else {}
-        for k, v in NEW_SEEN.items():
+        for k, v in list(NEW_SEEN.items()):
             seen[k] = sorted(v)[-CAP:]
         cur["src2_seen"] = seen
         tmp = SF + ".src2.tmp"
