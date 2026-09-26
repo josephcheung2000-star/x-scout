@@ -441,6 +441,12 @@ def tidy(d):
 
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "tick"
+    if mode == "probe":                                    # reachability check of the extra sources; no Drive, no ledger
+        rc, out = sh(["sources2.py", "3.5"], timeout=240)
+        print("sources2:", (out.strip().splitlines() or ["no output"])[-1][:600])
+        rc, out = sh(["misses.py"], timeout=240)
+        print("misses:", ([l for l in out.splitlines() if l.startswith("MISSES_JSON")] or ["no MISSES_JSON line"])[-1][:600])
+        return
     d = drive()
     now = jst_now()
     slot = next_slot(now)
