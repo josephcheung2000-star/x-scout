@@ -78,7 +78,9 @@ def main():
     status = {"ok": False, "errors": []}
     with sync_playwright() as p:
         b = p.chromium.launch(proxy={"server": os.environ["HTTPS_PROXY"]} if os.environ.get("HTTPS_PROXY") else None)
-        ctx = b.new_context(ignore_https_errors=True, locale="en-US", viewport={"width": 1280, "height": 2400})
+        ctx = b.new_context(ignore_https_errors=True, locale="en-US", viewport={"width": 1280, "height": 2400},
+                            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                                       "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
         ctx.add_cookies([{"name": "auth_token", "value": AT, "domain": ".x.com", "path": "/", "secure": True},
                          {"name": "ct0", "value": CT, "domain": ".x.com", "path": "/", "secure": True}])
         pg = ctx.new_page()
@@ -91,8 +93,16 @@ def main():
         pg.on("response", on_resp)
         pg.goto("https://x.com/home", timeout=60000)
         pg.wait_for_timeout(6000)
+        try:
+            pg.wait_for_selector("article", timeout=25000)   # slower hosts (e.g. GitHub runners) render later
+        except Exception:
+            pass
         if "login" in pg.url or pg.locator("article").count() == 0:
-            status["errors"].append(f"not logged in / no timeline (url={pg.url})")
+            try:
+                seen = f"title={pg.title()[:60]!r} text={pg.inner_text('body')[:160]!r}"
+            except Exception:
+                seen = "page unreadable"
+            status["errors"].append(f"not logged in / no timeline (url={pg.url}; {seen})")
         tabs = pg.locator('[role="tab"]')
         names = [tabs.nth(i).inner_text().strip() for i in range(tabs.count())]
         # order: Following first (true follow attribution), then topic tabs, then For you
