@@ -1,0 +1,65 @@
+name: x-scout-pipeline
+# Credentialed half of X-scout. Every 10 min: prepare the Claude input doc when a slot is near,
+# and apply any output the Claude run left in Drive (leads, alerts, playbook, run log, digest).
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      job:
+        description: "tick | prep | apply"
+        default: "tick"
+permissions:
+  contents: write
+concurrency:
+  group: xscout-state          # one run at a time: prep and apply both change the ledger
+  cancel-in-progress: false
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      X_AUTH_TOKEN: ${{ secrets.X_AUTH_TOKEN }}
+      X_CT0: ${{ secrets.X_CT0 }}
+      TG_TOKEN: ${{ secrets.TG_TOKEN }}
+      TG_STORE_CHAT: ${{ secrets.TG_STORE_CHAT }}
+      TG_ALERT_CHAT: ${{ secrets.TG_ALERT_CHAT }}
+      GWS_DRIVE: ${{ secrets.GWS_DRIVE }}
+      JOB: ${{ github.event.inputs.job || 'tick' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -q google-api-python-client google-auth
+      - name: Is a prep due?
+        id: need
+        run: |
+          if [ "$JOB" = "prep" ]; then echo "prep=yes" >> "$GITHUB_OUTPUT"; else echo "prep=$(python pipeline.py need-prep | tail -1)" >> "$GITHUB_OUTPUT"; fi
+      - name: Install Chromium (only before a prep)
+        if: steps.need.outputs.prep == 'yes'
+        run: |
+          pip install -q playwright
+          python -m playwright install --with-deps chromium > /dev/null
+      - name: Run pipeline
+        run: python pipeline.py "$JOB"
+      - name: Save once-a-day notice memory
+        if: always()
+        run: |
+          git config user.name "x-scout-pipeline"; git config user.email "actions@users.noreply.github.com"
+          git add health.json 2>/dev/null || true
+          git diff --cached --quiet || (git commit -q -m "health $(date -u +%FT%TZ)" && for i in 1 2 3; do git pull -q --rebase && git push -q && break; sleep 5; done)
+      - name: Alert on failure (once a day)
+        if: failure()
+        run: |
+          python - <<'EOF'
+          import json, os, datetime, urllib.request, urllib.parse
+          day = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).strftime("%Y-%m-%d")
+          try: h = json.load(open("health.json"))
+          except Exception: h = {}
+          if h.get("job_fail") != day:
+              h["job_fail"] = day; json.dump(h, open("health.json", "w"))
+              url = "%s/%s/actions/runs/%s" % (os.environ["GITHUB_SERVER_URL"], os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_RUN_ID"])
+              data = urllib.parse.urlencode({"chat_id": os.environ["TG_ALERT_CHAT"], "text": "X-scout: the GitHub pipeline job failed (" + url + "). Ask Claude to check.", "disable_web_page_preview": "true"}).encode()
+              urllib.request.urlopen("https://api.telegram.org/bot%s/sendMessage" % os.environ["TG_TOKEN"], data, timeout=30)
+          EOF
+          git add health.json; git commit -q -m "health" && git pull -q --rebase && git push -q || true

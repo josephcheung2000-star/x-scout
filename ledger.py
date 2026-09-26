@@ -707,7 +707,7 @@ def digest(send=False, if_due=False):
 
 NOTICES = {
     "pull": "X-scout: ledger pull failed — the storage channel or bot may have a problem; ask Claude to check.",
-    "fetch": "X-scout: X fetch failed ({reason}). The @jpihbdu cookies have probably expired: log into x.com as @jpihbdu, copy fresh auth_token and ct0 cookies, and ask Claude to update the X crypto scout task.",
+    "fetch": "X-scout: X fetch failed ({reason}). The @jpihbdu cookies have probably expired: log into x.com as @jpihbdu, copy fresh auth_token and ct0 cookies, and ask Claude to update the X-scout GitHub secrets.",
     "other": "X-scout: run problem ({reason}); ask Claude to check.",
 }
 

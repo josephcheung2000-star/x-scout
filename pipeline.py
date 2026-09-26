@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+"""X-scout pipeline on GitHub Actions. All credentialed work happens here, never in the Claude run.
+
+Every 10 minutes the workflow runs `python3 pipeline.py tick`, which does two things:
+  PREP  (once per slot, 5-40 min before each Claude run at HH:45 JST, HH = 2,5,...,23):
+        ledger pull -> poll-replies -> update prices/paper -> X fetch -> sources -> triage
+        -> write Google Doc "XS-IN <slot>" (one or more parts) into the X-scout Drive folder -> ledger push
+  APPLY (whenever Claude has left a "XS-OUT <slot>" JSON file in the folder):
+        ledger pull -> add leads -> send alerts (with Took/Skipped buttons) -> playbook -> runlog
+        -> digest if due -> ledger push -> rename the file "DONE XS-OUT ..."
+Env (repo secrets): X_AUTH_TOKEN, X_CT0, TG_TOKEN, TG_STORE_CHAT, TG_ALERT_CHAT, GWS_DRIVE (authorized_user JSON).
+The repo is public, so this script prints only counts and status words - never post text, leads or tokens."""
+import json, os, re, subprocess, sys, time, datetime
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaInMemoryUpload
+
+FOLDER = os.environ.get("XS_FOLDER", "11yC1KUtWZTUYoZIEuU_AoT8bFhomq6qo")   # Drive "X-scout" (info@)
+JST = datetime.timezone(datetime.timedelta(hours=9))
+SLOT_HOURS = [2, 5, 8, 11, 14, 17, 20, 23]            # Claude runs at HH:45 JST
+PREP_WINDOW = (5, 40)                                  # prep between 40 and 5 minutes before the slot
+PART_CHARS = 90000
+HEALTH = "health.json"                                 # committed by the workflow: once-per-day notice memory
+ERRORS = []
+
+
+def jst_now():
+    return datetime.datetime.now(JST)
+
+
+def next_slot(now):
+    for d in (0, 1):
+        day = now.date() + datetime.timedelta(days=d)
+        for h in SLOT_HOURS:
+            s = datetime.datetime(day.year, day.month, day.day, h, 45, tzinfo=JST)
+            if s >= now:
+                return s
+
+
+def slot_name(s):
+    return s.strftime("%Y-%m-%d %H%M")
+
+
+def drive():
+    info = json.loads(os.environ["GWS_DRIVE"])
+    return build("drive", "v3", credentials=Credentials.from_authorized_user_info(info), cache_discovery=False)
+
+
+def list_files(d, contains, extra=""):
+    q = f"'{FOLDER}' in parents and name contains '{contains}' and trashed = false {extra}"
+    out, tok = [], None
+    while True:
+        r = d.files().list(q=q, orderBy="createdTime", pageSize=100, pageToken=tok,
+                           fields="nextPageToken, files(id,name,mimeType,createdTime)").execute()
+        out += r.get("files", [])
+        tok = r.get("nextPageToken")
+        if not tok:
+            return out
+
+
+def read_file(d, f):
+    if f["mimeType"] == "application/vnd.google-apps.document":
+        b = d.files().export(fileId=f["id"], mimeType="text/plain").execute()
+    else:
+        b = d.files().get_media(fileId=f["id"]).execute()
+    return b.decode("utf-8-sig")
+
+
+def create_doc(d, title, text):
+    body = {"name": title, "parents": [FOLDER], "mimeType": "application/vnd.google-apps.document"}
+    return d.files().create(body=body, media_body=MediaInMemoryUpload(text.encode("utf-8"), mimetype="text/plain"),
+                            fields="id").execute()["id"]
+
+
+def rename(d, f, new):
+    d.files().update(fileId=f["id"], body={"name": new}).execute()
+
+
+def sh(args, timeout=900, env_extra=None):
+    """Run a script; return (rc, stdout). Output is NOT printed (public logs)."""
+    env = dict(os.environ, **(env_extra or {}))
+    try:
+        p = subprocess.run(["python3"] + args, capture_output=True, text=True, timeout=timeout, env=env)
+        return p.returncode, (p.stdout or "") + (("\n" + p.stderr[-800:]) if p.returncode else "")
+    except subprocess.TimeoutExpired:
+        return 124, "timeout"
+
+
+def err(msg):
+    msg = re.sub(r"bot\d+:[A-Za-z0-9_-]{20,}", "bot<redacted>", msg)
+    ERRORS.append(msg[:200])
+    print("ERROR:", msg.splitlines()[0][:120] if msg else "?")
+
+
+def load_json(p, default):
+    try:
+        return json.load(open(p))
+    except Exception:
+        return default
+
+
+def health_once(key):
+    """True the first time `key` is seen today (JST); records it in health.json."""
+    h = load_json(HEALTH, {})
+    today = jst_now().strftime("%Y-%m-%d")
+    if h.get(key) == today:
+        return False
+    h[key] = today
+    json.dump(h, open(HEALTH, "w"), indent=1)
+    return True
+
+
+def notify(kind, reason=""):
+    rc, _ = sh(["ledger.py", "notify", kind, reason], timeout=60)
+    print(f"notify {kind}: rc={rc}")
+
+
+def one_line(t, n):
+    return re.sub(r"\s+", " ", str(t or "")).strip()[:n]
+
+
+# ---------------------------------------------------------------- PREP
+def prep(d, slot):
+    name = "XS-IN " + slot_name(slot)
+    rc, out = sh(["ledger.py", "pull"], timeout=120)
+    if rc != 0:
+        time.sleep(30)
+        rc, out = sh(["ledger.py", "pull"], timeout=120)
+    if rc != 0:
+        err("ledger pull failed")
+        if health_once("pull_alert"):
+            notify("pull")
+        return False
+    for cmd in (["poll-replies"], ["update"]):
+        rc, out = sh(["ledger.py"] + cmd, timeout=600)
+        if rc != 0:
+            err(f"ledger {cmd[0]} failed")
+
+    # X fetch (Playwright chromium is installed by the workflow before prep)
+    for f in ("posts.json", "sources.json", "triage.json"):
+        if os.path.exists(f):
+            os.remove(f)
+    rc, out = sh(["xfetch_cloud.py", "300", "3.25"], timeout=660, env_extra={"XS_SCROLLS": "70"})
+    x = load_json("posts.json", {}).get("status") or {"ok": False, "errors": [f"fetch exit {rc}"]}
+    if not x.get("ok") or any("not logged in" in str(e) for e in x.get("errors", [])):
+        err("X fetch failed or not logged in")
+        if health_once("fetch_alert"):
+            notify("fetch", "not logged in or no timeline" if x.get("errors") else f"exit {rc}")
+    print(f"x: ok={x.get('ok')} captured={x.get('captured')} kept={x.get('kept')}")
+
+    rc, out = sh(["sources.py", "3.5"], timeout=300)
+    src = load_json("sources.json", {})
+    counts = {k: len(v) for k, v in src.items() if isinstance(v, list)}
+    src_errs = [f"{it.get('src')}: {one_line(it.get('error'), 80)}" for v in src.values() if isinstance(v, list)
+                for it in v if isinstance(it, dict) and "error" in it]
+    counts = {k: sum(1 for it in src.get(k, []) if isinstance(it, dict) and "error" not in it) for k in counts}
+    rc, out = sh(["triage.py"], timeout=300)
+    tri = load_json("triage.json", {"mode": "full", "triggers": [], "focus_ids": [], "read_all_posts": True})
+    print(f"sources: {counts} errors={len(src_errs)} | triage mode={tri.get('mode')} triggers={len(tri.get('triggers', []))}")
+
+    sweep = slot.hour == 8
+    extra = {}
+    for key, cmd in (("LEDGER BRIEF", ["brief"]), ("PLAYBOOK", ["playbook"]), ("ALERTED IN LAST 14 DAYS", ["alerted-recent"])) + \
+            ((("LEDGER STATS", ["stats"]), ("PAPER PORTFOLIO", ["paper"])) if sweep else ()) + \
+            ((("MONTHLY ACCOUNT REVIEW (saved for the digest)", ["handles", "--save"]),) if sweep and slot.day == 1 else ()):
+        rc, out = sh(["ledger.py"] + cmd, timeout=300)
+        extra[key] = out.strip() if rc == 0 else f"(failed: exit {rc})"
+
+    # pending prep record, merged into the run log when Claude's output is applied
+    s = load_json("state.json", None)
+    if isinstance(s, dict):
+        pend = s.get("pending_prep") if isinstance(s.get("pending_prep"), dict) else {}
+        pend[slot_name(slot)] = {"x": {k: x.get(k) for k in ("ok", "captured", "relevant", "kept")},
+                                 "sources": counts, "source_errors": src_errs, "mode": tri.get("mode"),
+                                 "prep_errors": list(ERRORS)}
+        s["pending_prep"] = dict(sorted(pend.items())[-12:])
+        json.dump(s, open("state.json", "w"), ensure_ascii=False, indent=1)
+
+    # ------------- build the input document
+    posts = load_json("posts.json", {}).get("posts") or []
+    full = tri.get("mode") == "full"
+    if not full:
+        chosen = []
+    elif tri.get("read_all_posts") or not tri.get("focus_ids"):
+        chosen = posts
+    else:
+        ids = set(tri.get("focus_ids"))
+        chosen = [p for p in posts if p.get("id") in ids]
+    L = [f"X-SCOUT INPUT {name}  (built {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC by GitHub Actions)",
+         f"MODE: {tri.get('mode')}{' (08:00 sweep: read every post)' if tri.get('sweep') else ''}",
+         f"X FETCH: {json.dumps({k: x.get(k) for k in ('ok', 'captured', 'relevant', 'kept', 'errors')}, ensure_ascii=False)}",
+         f"SOURCES: {json.dumps(counts)}" + (f" errors: {'; '.join(src_errs)}" if src_errs else ""),
+         f"PREP ERRORS: {'; '.join(ERRORS) if ERRORS else 'none'}", ""]
+    for k, v in extra.items():
+        L += [f"=== {k} ===", v, ""]
+    L += ["=== TRIAGE TRIGGERS ==="] + [json.dumps(t, ensure_ascii=False) for t in tri.get("triggers", [])] + [""]
+    if full:
+        L += ["=== EDGAR FILINGS TO REVIEW ==="] + [json.dumps(t, ensure_ascii=False) for t in tri.get("edgar_review", [])] + [""]
+        L += ["=== ENTITY COUNTS (accounts naming each asset) ===", json.dumps(tri.get("entity_counts", {}), ensure_ascii=False), ""]
+        L += ["=== PRIMARY SOURCES (last 3.5h) ==="]
+        for k in ("binance", "okx", "polymarket", "hyperliquid"):
+            for it in src.get(k, []):
+                if isinstance(it, dict) and "error" not in it:
+                    L.append(f"{k}: " + json.dumps(it, ensure_ascii=False))
+        L += ["", f"=== X POSTS TO READ ({len(chosen)} of {len(posts)} relevant posts; id | @handle (followers) | created UTC | likes/rts/replies/views | tab | text | url) ==="]
+        for p in chosen:
+            m = p.get("m") or {}
+            nested = " [inside a retweet/quote]" if p.get("nested") else ""
+            L.append(f"{p.get('id')} | @{p.get('handle')} ({p.get('followers')}) | {str(p.get('created'))[:16]} | "
+                     f"{m.get('likes')}/{m.get('rts')}/{m.get('replies')}/{m.get('views')} | {p.get('tab')}{nested} | "
+                     f"{one_line(p.get('text'), 700)} | {p.get('url')}")
+    L += ["", "END OF INPUT"]
+    text = "\n".join(L)
+    parts = [text[i:i + PART_CHARS] for i in range(0, len(text), PART_CHARS)] or [text]
+    for i, part in enumerate(parts):
+        title = name if len(parts) == 1 else f"{name} part {i + 1} of {len(parts)}"
+        create_doc(d, title, part)
+    print(f"input doc: {name}, {len(chosen)} posts, {len(text)} chars, {len(parts)} part(s)")
+
+    rc, out = sh(["ledger.py", "push"], timeout=120)
+    if rc != 0:
+        time.sleep(30)
+        rc, out = sh(["ledger.py", "push"], timeout=120)
+    if rc != 0:
+        err("ledger push after prep failed")
+    return True
+
+
+# ---------------------------------------------------------------- APPLY
+def apply(d):
+    outs = [f for f in list_files(d, "XS-OUT") if not f["name"].startswith(("DONE", "BAD"))]
+    if not outs:
+        print("apply: nothing to do")
+        return
+    rc, out = sh(["ledger.py", "pull"], timeout=120)
+    if rc != 0:
+        err("ledger pull failed (apply)")
+        if health_once("pull_alert"):
+            notify("pull")
+        return
+    for f in outs:
+        try:
+            o = json.loads(read_file(d, f))
+            assert isinstance(o, dict)
+        except Exception:
+            err(f"unreadable output file")
+            rename(d, f, "BAD " + f["name"])
+            if health_once("bad_out"):
+                notify("other", "the Claude run wrote an output file the pipeline could not read")
+            continue
+        slot = str(o.get("slot") or f["name"].replace("XS-OUT", "").strip())
+        run = o.get("run") if isinstance(o.get("run"), dict) else {}
+        run_errors = [str(e) for e in (run.get("errors") or [])]
+        leads = [l for l in (o.get("leads") or []) if isinstance(l, dict) and l.get("asset")]
+        if leads:
+            json.dump(leads, open("leads.json", "w"), ensure_ascii=False)
+            rc, out = sh(["ledger.py", "add", "leads.json"], timeout=300)
+            if rc != 0:
+                run_errors.append("ledger add failed")
+        sent = []
+        for a in (o.get("alerts") or [])[:2]:
+            if not isinstance(a, dict) or not a.get("asset") or not a.get("text"):
+                continue
+            asset = re.sub(r"[^A-Za-z0-9._-]", "", str(a["asset"]))[:20] or "X"
+            open(f"alert_{asset}.txt", "w").write(str(a["text"]))
+            json.dump(a.get("plan") or {}, open(f"plan_{asset}.json", "w"))
+            rc, out = sh(["ledger.py", "send-alert", f"alert_{asset}.txt", asset, f"plan_{asset}.json"], timeout=120)
+            if rc == 1:
+                time.sleep(20)
+                rc, out = sh(["ledger.py", "send-alert", f"alert_{asset}.txt", asset, f"plan_{asset}.json"], timeout=120)
+            if rc in (0, 2):
+                sent.append(asset)
+                if rc == 2:
+                    run_errors.append(f"alert {asset} only partly sent")
+            else:
+                run_errors.append(f"alert {asset} could not be sent")
+        if isinstance(o.get("playbook"), str) and o["playbook"].strip():
+            open("playbook.md", "w").write(o["playbook"])
+            rc, out = sh(["ledger.py", "set-playbook", "playbook.md"], timeout=60)
+            if rc != 0:
+                run_errors.append("set-playbook failed")
+        s = load_json("state.json", {})
+        pend = (s.get("pending_prep") or {}).pop(slot, {}) if isinstance(s.get("pending_prep"), dict) else {}
+        json.dump(s, open("state.json", "w"), ensure_ascii=False, indent=1)
+        rec = {"mode": run.get("mode") or pend.get("mode") or "full", "x": pend.get("x") or {"ok": None},
+               "sources": pend.get("sources") or {}, "source_errors": pend.get("source_errors") or [],
+               "posts_read": run.get("posts_read", 0), "items_read": run.get("items_read", 0),
+               "leads_logged": len(leads), "alerts_sent": sent, "near_misses": run.get("near_misses") or [],
+               "errors": (pend.get("prep_errors") or []) + run_errors}
+        json.dump(rec, open("run.json", "w"), ensure_ascii=False)
+        sh(["ledger.py", "runlog", "run.json"], timeout=60)
+        rename(d, f, "DONE " + f["name"])
+        print(f"applied output for slot {slot}: {len(leads)} leads, {len(sent)} alert(s)")
+    rc, out = sh(["ledger.py", "digest", "--if-due"], timeout=120)
+    print("digest:", "sent" if "DIGEST: sent" in out else "not due / not sent")
+    rc, out = sh(["ledger.py", "push"], timeout=120)
+    if rc != 0:
+        time.sleep(30)
+        rc, out = sh(["ledger.py", "push"], timeout=120)
+    if rc != 0:
+        err("ledger push after apply failed")
+
+
+def tidy(d):
+    """Trash pipeline files older than 7 days (the human-readable run logs are kept)."""
+    cutoff = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S")
+    for key in ("XS-IN", "XS-OUT"):
+        for f in list_files(d, key, f"and createdTime < '{cutoff}'"):
+            d.files().update(fileId=f["id"], body={"trashed": True}).execute()
+
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else "tick"
+    d = drive()
+    now = jst_now()
+    slot = next_slot(now)
+    mins = (slot - now).total_seconds() / 60
+    want_prep = mode == "prep" or (mode in ("tick", "need-prep") and PREP_WINDOW[0] <= mins <= PREP_WINDOW[1])
+    if want_prep and mode != "prep":
+        if list_files(d, "XS-IN " + slot_name(slot)):
+            want_prep = False                              # already prepared for this slot
+    if mode == "need-prep":                                # workflow asks first, so Chromium is installed only when needed
+        print("yes" if want_prep else "no")
+        return
+    if want_prep:
+        prep(d, slot)
+    if mode in ("tick", "apply"):
+        apply(d)
+    if now.hour == 4 and now.minute < 10:
+        try:
+            tidy(d)
+        except Exception:
+            err("tidy failed")
+    if ERRORS:
+        print(f"{len(ERRORS)} problem(s) this tick")
+
+
+if __name__ == "__main__":
+    main()
