@@ -20,7 +20,7 @@ FOLDER = os.environ.get("XS_FOLDER", "11yC1KUtWZTUYoZIEuU_AoT8bFhomq6qo")   # Dr
 JST = datetime.timezone(datetime.timedelta(hours=9))
 SLOT_HOURS = [2, 5, 8, 11, 14, 17, 20, 23]            # Claude runs at HH:45 JST
 PREP_WINDOW = (3, 45)                                  # prep between 45 and 3 minutes before the slot
-PART_CHARS = 28000                                     # the Claude run's Drive reader truncates long docs; keep parts small
+PART_CHARS = 12000                                     # the Claude run's Drive reader truncates long docs; keep parts small
 HEALTH = "health.json"                                 # committed by the workflow: once-per-day notice memory
 ERRORS = []
 SLOT_RX = re.compile(r"\d{4}-\d{2}-\d{2} \d{4}")
