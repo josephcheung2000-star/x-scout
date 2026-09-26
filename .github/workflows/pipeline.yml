@@ -40,8 +40,12 @@ jobs:
         run: |
           pip install -q playwright
           python -m playwright install --with-deps chromium > /dev/null
+          sudo apt-get install -y -q xvfb > /dev/null
       - name: Run pipeline
-        run: python pipeline.py "$JOB"
+        env:
+          XS_CHANNEL: chrome
+          XS_HEADFUL: "1"
+        run: if [ "${{ steps.need.outputs.prep }}" = "yes" ]; then xvfb-run -a python pipeline.py "$JOB"; else python pipeline.py "$JOB"; fi
       - name: Save once-a-day notice memory
         if: always()
         run: |

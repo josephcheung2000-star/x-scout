@@ -77,7 +77,13 @@ def main():
     cur_tab = {"v": "for-you"}
     status = {"ok": False, "errors": []}
     with sync_playwright() as p:
-        b = p.chromium.launch(proxy={"server": os.environ["HTTPS_PROXY"]} if os.environ.get("HTTPS_PROXY") else None)
+        launch = {"proxy": {"server": os.environ["HTTPS_PROXY"]} if os.environ.get("HTTPS_PROXY") else None}
+        if os.environ.get("XS_CHANNEL"):          # e.g. "chrome" on GitHub runners (real Chrome passes bot checks more often)
+            launch["channel"] = os.environ["XS_CHANNEL"]
+        if os.environ.get("XS_HEADFUL"):          # run with a visible window under xvfb-run
+            launch["headless"] = False
+            launch["args"] = ["--disable-blink-features=AutomationControlled"]
+        b = p.chromium.launch(**launch)
         ctx = b.new_context(ignore_https_errors=True, locale="en-US", viewport={"width": 1280, "height": 2400},
                             user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
                                        "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
@@ -93,6 +99,13 @@ def main():
         pg.on("response", on_resp)
         pg.goto("https://x.com/home", timeout=60000)
         pg.wait_for_timeout(6000)
+        for _ in range(12):                       # wait out a "Just a moment..." bot check (up to ~60 s)
+            try:
+                if "just a moment" not in pg.title().lower():
+                    break
+            except Exception:
+                pass
+            pg.wait_for_timeout(5000)
         try:
             pg.wait_for_selector("article", timeout=25000)   # slower hosts (e.g. GitHub runners) render later
         except Exception:
