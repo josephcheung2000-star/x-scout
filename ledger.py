@@ -19,6 +19,7 @@ PLAN.json: {"direction": "long"|"short", "entry_lo": p, "entry_hi": p, "stop": p
  "horizon_days": n, "size_pct": 2.0}   size_pct = % of book; paper trade fills when price trades inside the entry zone,
  exits at stop / take-profits / horizon (same-candle stop+TP counts as stop - conservative)
   ledger.py alerted-recent       JSON list of leads alerted in the last 14 days (for repeat-alert checks)
+  ledger.py notify pull|fetch|other [reason]   send one short fixed-template failure notice to Joseph
   ledger.py add leads.json       add shortlisted leads (list of dicts, see LEAD FIELDS) with entry prices
   ledger.py update               refresh prices of open leads; fill 1d/3d/7d/14d/30d checkpoints; close at 30d
   ledger.py stats                performance by score bucket / alerted / catalyst type / component / handle
@@ -704,6 +705,19 @@ def digest(send=False, if_due=False):
         except Exception as e:
             print(f"DIGEST: send failed ({str(e)[:120]}) - a later run today will retry")
 
+NOTICES = {
+    "pull": "X-scout: ledger pull failed — the storage channel or bot may have a problem; ask Claude to check.",
+    "fetch": "X-scout: X fetch failed ({reason}). The @jpihbdu cookies have probably expired: log into x.com as @jpihbdu, copy fresh auth_token and ct0 cookies, and ask Claude to update the X crypto scout task.",
+    "other": "X-scout: run problem ({reason}); ask Claude to check.",
+}
+
+def notify(kind, reason=""):
+    """Send one short fixed-template notice to Joseph's chat. Only the templates above can be sent."""
+    if kind not in NOTICES: print(f"NOTIFY: unknown kind {kind}; use one of {list(NOTICES)}"); sys.exit(1)
+    reason = re.sub(r"[A-Za-z0-9_:\-]{25,}", "[redacted]", reason)[:160] or "no detail"
+    r = tg("sendMessage", chat_id=ALERT_CHAT, text=NOTICES[kind].format(reason=reason), disable_web_page_preview="true")
+    print("NOTIFY: sent" if r.get("ok") else "NOTIFY: failed"); sys.exit(0 if r.get("ok") else 1)
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "pull": pull(init="--init" in sys.argv); sys.exit(0)
@@ -727,4 +741,5 @@ if __name__ == "__main__":
         try: handles("--save" in sys.argv)
         except Exception as e: print(f"HANDLES FAILED (continuing): {str(e)[:120]}")
     elif cmd == "alerted-recent": alerted_recent()
+    elif cmd == "notify": notify(sys.argv[2], " ".join(sys.argv[3:]))
     else: print(__doc__)
