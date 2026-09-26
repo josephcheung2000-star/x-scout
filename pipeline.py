@@ -3,8 +3,9 @@
 
 Every 10 minutes the workflow runs `python3 pipeline.py tick`, which does two things:
   PREP  (once per slot, 3-45 min before each Claude run at HH:45 JST, HH = 2,5,...,23):
-        ledger pull -> poll-replies -> update prices/paper -> X posts (from the Mac feeder via Drive) -> sources -> triage
-        -> write Google Doc "XS-IN <slot>" (one or more parts) into the X-scout Drive folder -> ledger push
+        ledger pull -> poll-replies -> update prices/paper -> [08:45 slot: miss log] -> X posts (from the Mac feeder via
+        Drive) -> sources + sources2 (Korea/Coinbase listings, unlocks, governance, ETF flows, insider buys, US stock
+        movers, commodities, regime, Polymarket) -> triage (+ new second-tier triggers) -> write Google Doc "XS-IN <slot>" (one or more parts) into the X-scout Drive folder -> ledger push
   APPLY (whenever Claude has left a "XS-OUT <slot>" JSON file in the folder):
         ledger pull -> add leads -> send alerts (with Took/Skipped buttons) -> playbook -> runlog
         -> digest if due -> ledger push -> rename the file "DONE XS-OUT ..."
@@ -23,6 +24,11 @@ PART_CHARS = 28000                                     # the Claude run's Drive 
 HEALTH = "health.json"                                 # committed by the workflow: once-per-day notice memory
 ERRORS = []
 SLOT_RX = re.compile(r"\d{4}-\d{2}-\d{2} \d{4}")
+TRIG_TTL_DAYS = 7                                      # a second-tier trigger key re-fires only after this many days
+S2_PER_KEY = 10                                        # second-tier items shown per source in the input doc
+S2_KEYS = ["coinbase_new", "upbit_krw_new", "bithumb_krw_new", "bithumb_notices", "unlocks_14d", "governance", "etf_flows",
+           "insider_buys", "stock_movers", "commodities", "polymarket_extra"]
+S2_DROP = {"src", "id", "at", "url", "title", "rule", "recipients", "description"}
 
 
 def jst_now():
@@ -136,10 +142,16 @@ def prep(d, slot):
         rc, out = sh(["ledger.py"] + cmd, timeout=600)
         if rc != 0:
             err(f"ledger {cmd[0]} failed")
+    miss_summary = None
+    if slot.hour == 8:                                         # once a day: which big moves did the scout miss?
+        rc, out = sh(["misses.py"], timeout=240)
+        miss_summary = "\n".join(l for l in out.splitlines() if l.strip() and not l.startswith("MISSES_JSON")).strip()
+        mj = [l for l in out.splitlines() if l.startswith("MISSES_JSON")]
+        print("misses:", "ok" if rc == 0 and mj and '"error"' not in mj[-1] else f"problem rc={rc}")
 
     # X posts come from the Mac feeder (X shows cloud/datacenter IPs a bot wall): use every unused
     # XS-POSTS file from the last 3.5 h, newest status wins, posts merged and de-duplicated.
-    for f in ("posts.json", "sources.json", "triage.json"):
+    for f in ("posts.json", "sources.json", "sources2.json", "triage.json"):
         if os.path.exists(f):
             os.remove(f)
     x = {"ok": False, "errors": ["no X posts from the Mac feeder in the last 3.5 h (Mac asleep or offline?)"]}
@@ -182,17 +194,50 @@ def prep(d, slot):
     src_errs = [f"{it.get('src')}: {one_line(it.get('error'), 80)}" for v in src.values() if isinstance(v, list)
                 for it in v if isinstance(it, dict) and "error" in it]
     counts = {k: sum(1 for it in src.get(k, []) if isinstance(it, dict) and "error" not in it) for k in counts}
+    rc, out = sh(["sources2.py", "3.5"], timeout=240)
+    s2 = load_json("sources2.json", {})
+    if not isinstance(s2, dict) or "counts" not in s2:
+        s2 = {}
+        err("second-tier sources (sources2) produced no output")
+    for k, v in (s2.get("counts") or {}).items():
+        counts[k] = v
+    src_errs += [f"s2 {one_line(e, 90)}" for e in (s2.get("errors") or [])][:8]
     rc, out = sh(["triage.py"], timeout=300)
     tri = load_json("triage.json", {"mode": "full", "triggers": [], "focus_ids": [], "read_all_posts": True})
-    print(f"sources: {counts} errors={len(src_errs)} | triage mode={tri.get('mode')} triggers={len(tri.get('triggers', []))}")
+    # second-tier triggers: each event key counts once per TRIG_TTL_DAYS; any new one makes this a full run
+    st = load_json("state.json", None)
+    new_trig = []
+    if isinstance(st, dict):
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        cut = (now_utc - datetime.timedelta(days=TRIG_TTL_DAYS)).isoformat(timespec="minutes")
+        seen = st.get("trig_seen") if isinstance(st.get("trig_seen"), dict) else {}
+        seen = {k: v for k, v in seen.items() if str(v) >= cut}
+        for t in s2.get("triggers") or []:
+            if isinstance(t, dict) and t.get("key") and t["key"] not in seen:
+                new_trig.append(t)
+                seen[t["key"]] = now_utc.isoformat(timespec="minutes")
+        st["trig_seen"] = seen
+        json.dump(st, open("state.json", "w"), ensure_ascii=False, indent=1)
+    if new_trig:
+        tri["triggers"] = list(tri.get("triggers") or []) + new_trig
+        if tri.get("mode") != "full":
+            tri["mode"], tri["read_all_posts"] = "full", True
+    print(f"sources: {len(counts)} feeds, errors={len(src_errs)} | triage mode={tri.get('mode')} triggers={len(tri.get('triggers', []))} (new second-tier {len(new_trig)})")
 
     sweep = slot.hour == 8
     extra = {}
-    for key, cmd in (("LEDGER BRIEF", ["brief"]), ("PLAYBOOK", ["playbook"]), ("ALERTED IN LAST 14 DAYS", ["alerted-recent"])) + \
+    for key, cmd in (("LEDGER BRIEF", ["brief"]), ("PLAYBOOK", ["playbook"]), ("ALERTED IN LAST 14 DAYS", ["alerted-recent"]),
+                     ("HANDLE TRACK RECORDS (use the weight in scoring)", ["handle-scores"])) + \
             ((("LEDGER STATS", ["stats"]), ("PAPER PORTFOLIO", ["paper"])) if sweep else ()) + \
             ((("MONTHLY ACCOUNT REVIEW (saved for the digest)", ["handles", "--save"]),) if sweep and slot.day == 1 else ()):
         rc, out = sh(["ledger.py"] + cmd, timeout=300)
         extra[key] = out.strip() if rc == 0 else f"(failed: exit {rc})"
+    extra["BACKTESTED PRIORS (v2; base rates per catalyst type - they supersede PLAYBOOK PRIORS where both cover a type)"] = priors_text()
+    reg = [r for r in (s2.get("regime") or []) if isinstance(r, dict) and "error" not in r]
+    extra["MARKET REGIME"] = "\n".join(one_line(json.dumps({k: v for k, v in r.items() if k not in ("src", "id", "url")}, ensure_ascii=False), 500)
+                                       for r in reg) or "(unavailable this run)"
+    if miss_summary is not None:
+        extra["MISS LOG (big moves of the last day and whether a lead flagged them)"] = miss_summary or "(miss log failed)"
 
     # pending prep record, merged into the run log when Claude's output is applied
     s = load_json("state.json", None)
@@ -230,6 +275,15 @@ def prep(d, slot):
             for it in src.get(k, []):
                 if isinstance(it, dict) and "error" not in it:
                     L.append(f"{k}: " + json.dumps(it, ensure_ascii=False))
+        L += ["", "=== SECOND-TIER SOURCES (Korea/Coinbase listings, unlocks, governance, ETF flows, insider buys, US stock movers, commodities, Polymarket) ==="]
+        for k in S2_KEYS:
+            items = [it for it in (s2.get(k) or []) if isinstance(it, dict) and "error" not in it]
+            cap = len(items) if k == "commodities" else S2_PER_KEY
+            for it in items[:cap]:
+                rest = {a: b for a, b in it.items() if a not in S2_DROP and b not in (None, "", [], {})}
+                L.append(one_line(f"{k}: {it.get('title')} | {it.get('url')} | {json.dumps(rest, ensure_ascii=False, default=str)}", 420))
+            if len(items) > cap:
+                L.append(f"{k}: (+{len(items) - cap} more not shown)")
         L += ["", f"=== X POSTS TO READ ({len(chosen)} of {len(posts)} relevant posts; id | @handle (followers) | created UTC | likes/rts/replies/views | tab | text | url) ==="]
         for p in chosen:
             m = p.get("m") or {}
@@ -261,6 +315,25 @@ def prep(d, slot):
         err("ledger push after prep failed")
         return False
     return True
+
+
+def priors_text():
+    try:
+        T = json.load(open("priors.json")).get("types") or {}
+    except Exception:
+        return "(priors.json unreadable)"
+    out = []
+    for k, v in T.items():
+        if not isinstance(v, dict):
+            continue
+        ci = v.get("ci95") or [None, None]
+        med = v.get("median_excess_7d", v.get("median"))
+        try:
+            out.append(f"{k}: n={v.get('n')} {v.get('horizon', '7d')} median excess {float(med):+.1%}, hit {float(v.get('hit_rate') or 0):.0%}, "
+                       f"CI95 [{float(ci[0]):+.1%}, {float(ci[1]):+.1%}], score adj {v.get('score_adj', 0):+}{' (weak)' if v.get('weak') else ''} - {one_line(v.get('note'), 140)}")
+        except Exception:
+            out.append(f"{k}: {one_line(json.dumps(v), 200)}")
+    return "\n".join(out) or "(no priors)"
 
 
 # ---------------------------------------------------------------- APPLY

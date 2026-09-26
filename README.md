@@ -21,3 +21,14 @@ Joseph's crypto/investment scout. It runs every 3 h, before each Claude run at H
 The ledger state is the pinned JSON document in the private Telegram channel "X-scout storage" (`ledger.py`, which uses an optimistic version lock). `backtest.py` and `playbook_v1.md` hold the audited priors.
 
 This repo is public: scripts only, no credentials, no data. The Actions logs print counts only.
+
+## Signal-quality upgrade (2026-09-27)
+- `sources2.py`: second-tier sources (Coinbase/Upbit/Bithumb new markets, DefiLlama unlocks, Snapshot governance, US spot ETF flows,
+  OpenInsider buys, US stock movers, commodity futures, BTC/SPY regime, extra Polymarket). New trigger keys fire once per 7 days
+  (`state.trig_seen`) and force a full run.
+- `misses.py`: daily miss log (08:45 prep) - big movers in crypto / US stocks / commodities / Polymarket and whether a lead
+  flagged them; 14-day recall in `state.miss_stats`, shown in the digest.
+- `backtest2.py` -> `priors.json` / `priors_v2.md`: backtested base rates per catalyst type, included in every input doc.
+- `ledger.py`: lead kinds commodity (Yahoo futures ticker) and polymarket (market_slug + outcome); EV fields (p_win, target,
+  stop, horizon) with target-vs-stop resolution and Brier calibration; paper trades net of fees, slippage and funding;
+  per-account track records with shrinkage (`handle-scores`); 👍/👎 buttons on digest near-misses (`poll-replies`).

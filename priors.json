@@ -1,0 +1,577 @@
+{
+ "generated": "2026-09-26T15:18:18+00:00",
+ "method": "Entry = first price >=3h after the event became public (crypto: hourly; stocks/commodities: next session open; Polymarket: hourly, +3h). Excess vs BTC (crypto) or SPY (US stocks); commodities absolute; Polymarket in probability points signed in the move direction; commodity returns are raw (for down-shocks negative = continuation). Insider entry = first regular-session open after the filing timestamp (same day if filed before 09:30 ET). One event per asset per 7 days. Median CI = 1000-resample bootstrap. weak = n<20. Crypto types capped at 120 random events (seed 7), insider buys at 150.",
+ "types": {
+  "coinbase_listing": {
+   "n": 71,
+   "horizon": "7d",
+   "median_excess_7d": -0.1067,
+   "mean_excess": -0.1241,
+   "hit_rate": 0.282,
+   "p25": -0.2613,
+   "p75": 0.0181,
+   "ci95": [
+    -0.171,
+    -0.084
+   ],
+   "recent120": {
+    "n": 7,
+    "median": -0.0773
+   },
+   "events_found": 95,
+   "weak": false,
+   "note": "Coinbase listing: drifts down - avoid long / short",
+   "halves_median": [
+    -0.1193,
+    -0.095
+   ],
+   "h_1d": {
+    "n": 71,
+    "median": -0.0325,
+    "hit_rate": 0.38,
+    "ci95": [
+     -0.076,
+     -0.0003
+    ]
+   },
+   "h_30d": {
+    "n": 70,
+    "median": -0.2315,
+    "hit_rate": 0.214,
+    "ci95": [
+     -0.3203,
+     -0.1763
+    ]
+   },
+   "benchmark": "BTC",
+   "score_adj": -1
+  },
+  "upbit_krw_listing": {
+   "n": 76,
+   "horizon": "7d",
+   "median_excess_7d": -0.254,
+   "mean_excess": -0.2147,
+   "hit_rate": 0.092,
+   "p25": -0.3324,
+   "p75": -0.0697,
+   "ci95": [
+    -0.2848,
+    -0.2061
+   ],
+   "recent120": {
+    "n": 26,
+    "median": -0.231
+   },
+   "events_found": 84,
+   "weak": false,
+   "note": "Upbit KRW listing: drifts down - avoid long / short",
+   "halves_median": [
+    -0.2649,
+    -0.2373
+   ],
+   "h_1d": {
+    "n": 76,
+    "median": -0.1203,
+    "hit_rate": 0.197,
+    "ci95": [
+     -0.158,
+     -0.0779
+    ]
+   },
+   "h_30d": {
+    "n": 74,
+    "median": -0.3519,
+    "hit_rate": 0.176,
+    "ci95": [
+     -0.4213,
+     -0.2853
+    ]
+   },
+   "benchmark": "BTC",
+   "score_adj": -2
+  },
+  "bithumb_krw_listing": {
+   "n": 87,
+   "horizon": "7d",
+   "median_excess_7d": -0.2069,
+   "mean_excess": -0.1674,
+   "hit_rate": 0.161,
+   "p25": -0.3026,
+   "p75": -0.0623,
+   "ci95": [
+    -0.2422,
+    -0.1476
+   ],
+   "recent120": {
+    "n": 29,
+    "median": -0.2149
+   },
+   "events_found": 96,
+   "weak": false,
+   "note": "Bithumb KRW listing: drifts down - avoid long / short",
+   "halves_median": [
+    -0.2304,
+    -0.1841
+   ],
+   "h_1d": {
+    "n": 87,
+    "median": -0.0569,
+    "hit_rate": 0.322,
+    "ci95": [
+     -0.0886,
+     -0.0336
+    ]
+   },
+   "h_30d": {
+    "n": 82,
+    "median": -0.3335,
+    "hit_rate": 0.11,
+    "ci95": [
+     -0.4298,
+     -0.2702
+    ]
+   },
+   "benchmark": "BTC",
+   "score_adj": -2
+  },
+  "token_unlock": {
+   "n": 110,
+   "horizon": "-7d..+7d",
+   "median_excess_7d": -0.0704,
+   "mean_excess": -0.017,
+   "hit_rate": 0.327,
+   "p25": -0.1917,
+   "p75": 0.0274,
+   "ci95": [
+    -0.0963,
+    -0.0358
+   ],
+   "recent120": {
+    "n": 29,
+    "median": -0.0443
+   },
+   "events_found": 120,
+   "weak": false,
+   "note": "Big cliff unlock (entered 7d before): drifts down - avoid long / short",
+   "halves_median": [
+    -0.0795,
+    -0.0681
+   ],
+   "h_-7d..0": {
+    "n": 111,
+    "median": -0.0517,
+    "hit_rate": 0.342,
+    "ci95": [
+     -0.0679,
+     -0.0202
+    ]
+   },
+   "h_-1d..+7d": {
+    "n": 111,
+    "median": -0.024,
+    "hit_rate": 0.405,
+    "ci95": [
+     -0.0501,
+     -0.0027
+    ]
+   },
+   "benchmark": "BTC",
+   "score_adj": -2
+  },
+  "token_unlock_dm1": {
+   "n": 111,
+   "horizon": "-1d..+7d",
+   "median_excess_7d": -0.024,
+   "mean_excess": 0.0119,
+   "hit_rate": 0.405,
+   "p25": -0.1158,
+   "p75": 0.0759,
+   "ci95": [
+    -0.0501,
+    -0.0027
+   ],
+   "recent120": {
+    "n": 29,
+    "median": -0.0281
+   },
+   "events_found": 120,
+   "weak": false,
+   "note": "Big cliff unlock (entered 1d before): drifts down - avoid long / short",
+   "halves_median": [
+    -0.0364,
+    -0.0197
+   ],
+   "benchmark": "BTC",
+   "score_adj": -2
+  },
+  "governance_buyback": {
+   "n": 10,
+   "horizon": "7d",
+   "median_excess_7d": 0.0214,
+   "mean_excess": 0.0368,
+   "hit_rate": 0.6,
+   "p25": -0.0185,
+   "p75": 0.0842,
+   "ci95": [
+    -0.0229,
+    0.0921
+   ],
+   "recent120": {
+    "n": 5,
+    "median": 0.0228
+   },
+   "events_found": 10,
+   "weak": true,
+   "note": "Weak sample: Passed buyback/fee-switch vote: no edge (CI spans 0), score neutral",
+   "halves_median": [
+    -0.0054,
+    0.0228
+   ],
+   "h_30d": {
+    "n": 8,
+    "median": 0.0418,
+    "hit_rate": 0.5,
+    "ci95": [
+     -0.0676,
+     0.2192
+    ]
+   },
+   "benchmark": "BTC",
+   "score_adj": 0
+  },
+  "insider_cluster_buy": {
+   "n": 133,
+   "horizon": "20d",
+   "median_excess_7d": 0.0216,
+   "mean_excess": 0.0324,
+   "hit_rate": 0.556,
+   "p25": -0.0492,
+   "p75": 0.0932,
+   "ci95": [
+    -0.009,
+    0.0426
+   ],
+   "recent120": {
+    "n": 34,
+    "median": 0.0259
+   },
+   "events_found": 150,
+   "weak": false,
+   "note": "Insider cluster buy: no edge (CI spans 0), score neutral",
+   "halves_median": [
+    0.0146,
+    0.0255
+   ],
+   "h_5d": {
+    "n": 133,
+    "median": -0.0011,
+    "hit_rate": 0.489,
+    "ci95": [
+     -0.014,
+     0.0079
+    ]
+   },
+   "benchmark": "SPY",
+   "score_adj": 0
+  },
+  "stock_big_move_up": {
+   "n": 191,
+   "horizon": "20d",
+   "median_excess_7d": 0.0026,
+   "mean_excess": 0.0272,
+   "hit_rate": 0.508,
+   "p25": -0.0731,
+   "p75": 0.0822,
+   "ci95": [
+    -0.0189,
+    0.0177
+   ],
+   "recent120": {
+    "n": 34,
+    "median": -0.0586
+   },
+   "events_found": 197,
+   "weak": false,
+   "note": "Large-cap +8% day: no edge (CI spans 0), score neutral",
+   "halves_median": [
+    0.0133,
+    -0.0199
+   ],
+   "h_5d": {
+    "n": 193,
+    "median": -0.0019,
+    "hit_rate": 0.482,
+    "ci95": [
+     -0.0081,
+     0.0111
+    ]
+   },
+   "benchmark": "SPY",
+   "score_adj": 0
+  },
+  "stock_big_move_down": {
+   "n": 198,
+   "horizon": "20d",
+   "median_excess_7d": 0.0046,
+   "mean_excess": 0.0022,
+   "hit_rate": 0.505,
+   "p25": -0.0654,
+   "p75": 0.073,
+   "ci95": [
+    -0.0181,
+    0.0224
+   ],
+   "recent120": {
+    "n": 38,
+    "median": -0.0255
+   },
+   "events_found": 202,
+   "weak": false,
+   "note": "Large-cap -8% day: no edge (CI spans 0), score neutral",
+   "halves_median": [
+    0.0044,
+    0.0047
+   ],
+   "h_5d": {
+    "n": 202,
+    "median": -0.0028,
+    "hit_rate": 0.48,
+    "ci95": [
+     -0.0097,
+     0.0093
+    ]
+   },
+   "benchmark": "SPY",
+   "score_adj": 0
+  },
+  "commodity_shock_up": {
+   "n": 140,
+   "horizon": "20d",
+   "median_excess_7d": -0.0094,
+   "mean_excess": -0.0082,
+   "hit_rate": 0.4,
+   "p25": -0.0503,
+   "p75": 0.0347,
+   "ci95": [
+    -0.027,
+    -0.0035
+   ],
+   "recent120": {
+    "n": 9,
+    "median": 0.0257
+   },
+   "events_found": 143,
+   "weak": false,
+   "note": "Commodity up-shock: fades - do not chase",
+   "halves_median": [
+    -0.0232,
+    -0.0033
+   ],
+   "h_5d": {
+    "n": 141,
+    "median": 0.0049,
+    "hit_rate": 0.567,
+    "ci95": [
+     -0.0015,
+     0.012
+    ]
+   },
+   "benchmark": "none (absolute)",
+   "score_adj": -1
+  },
+  "commodity_shock_down": {
+   "n": 101,
+   "horizon": "20d",
+   "median_excess_7d": 0.0095,
+   "mean_excess": 0.0171,
+   "hit_rate": 0.564,
+   "p25": -0.023,
+   "p75": 0.054,
+   "ci95": [
+    -0.0104,
+    0.0255
+   ],
+   "recent120": {
+    "n": 4,
+    "median": -0.0181
+   },
+   "events_found": 103,
+   "weak": false,
+   "note": "Commodity down-shock: no edge (CI spans 0), score neutral",
+   "halves_median": [
+    0.0077,
+    0.0135
+   ],
+   "h_5d": {
+    "n": 103,
+    "median": 0.0004,
+    "hit_rate": 0.515,
+    "ci95": [
+     -0.005,
+     0.0103
+    ]
+   },
+   "benchmark": "none (absolute)",
+   "score_adj": 0
+  },
+  "polymarket_big_move": {
+   "n": 262,
+   "horizon": "7d",
+   "median_excess_7d": -0.018,
+   "mean_excess": -0.0403,
+   "hit_rate": 0.408,
+   "p25": -0.15,
+   "p75": 0.06,
+   "ci95": [
+    -0.045,
+    0.0
+   ],
+   "recent120": {
+    "n": 28,
+    "median": -0.015
+   },
+   "events_found": 265,
+   "weak": false,
+   "note": "Polymarket 15-pt move: no edge (CI spans 0), score neutral",
+   "halves_median": [
+    -0.01,
+    -0.025
+   ],
+   "h_3d": {
+    "n": 261,
+    "median": -0.01,
+    "hit_rate": 0.414,
+    "ci95": [
+     -0.025,
+     -0.004
+    ]
+   },
+   "benchmark": "none (absolute)",
+   "units": "probability points, signed in the direction of the move (+ = continuation)",
+   "score_adj": 0
+  },
+  "polymarket_big_move_up": {
+   "n": 131,
+   "horizon": "7d",
+   "median_excess_7d": -0.09,
+   "mean_excess": -0.0803,
+   "hit_rate": 0.29,
+   "p25": -0.227,
+   "p75": 0.015,
+   "ci95": [
+    -0.123,
+    -0.05
+   ],
+   "recent120": {
+    "n": 17,
+    "median": -0.028
+   },
+   "events_found": 133,
+   "weak": false,
+   "note": "Polymarket 15-pt jump up: mean-reverts - fade the move",
+   "halves_median": [
+    -0.09,
+    -0.104
+   ],
+   "h_3d": {
+    "n": 132,
+    "median": -0.05,
+    "hit_rate": 0.303,
+    "ci95": [
+     -0.06,
+     -0.0225
+    ]
+   },
+   "benchmark": "none (absolute)",
+   "units": "probability points, signed in the direction of the move (+ = continuation)",
+   "score_adj": -2
+  },
+  "polymarket_big_move_down": {
+   "n": 131,
+   "horizon": "7d",
+   "median_excess_7d": 0.01,
+   "mean_excess": -0.0003,
+   "hit_rate": 0.527,
+   "p25": -0.0625,
+   "p75": 0.1,
+   "ci95": [
+    -0.005,
+    0.035
+   ],
+   "recent120": {
+    "n": 11,
+    "median": -0.01
+   },
+   "events_found": 132,
+   "weak": false,
+   "note": "Polymarket 15-pt drop: no edge (CI spans 0), score neutral",
+   "halves_median": [
+    -0.0,
+    0.0225
+   ],
+   "h_3d": {
+    "n": 129,
+    "median": 0.01,
+    "hit_rate": 0.527,
+    "ci95": [
+     -0.005,
+     0.029
+    ]
+   },
+   "benchmark": "none (absolute)",
+   "units": "probability points, signed in the direction of the move (+ = continuation)",
+   "score_adj": 0
+  },
+  "binance_new_listing": {
+   "n": 54,
+   "horizon": "7d",
+   "median_excess_7d": -0.18,
+   "mean_excess": null,
+   "hit_rate": 0.3,
+   "ci95": [
+    -0.3,
+    -0.09
+   ],
+   "recent120": {
+    "n": null,
+    "median": null
+   },
+   "note": "Binance listing/HODLer pops fade: short/avoid long",
+   "weak": false,
+   "source": "playbook_v1"
+  },
+  "binance_perp_launch": {
+   "n": 24,
+   "horizon": "7d",
+   "median_excess_7d": -0.15,
+   "mean_excess": null,
+   "hit_rate": 0.38,
+   "ci95": [
+    -0.3,
+    0.15
+   ],
+   "recent120": {
+    "n": null,
+    "median": null
+   },
+   "note": "Mild negative, CI spans 0: no edge",
+   "weak": false,
+   "source": "playbook_v1"
+  },
+  "binance_add_existing": {
+   "n": 8,
+   "horizon": "7d",
+   "median_excess_7d": -0.04,
+   "mean_excess": null,
+   "hit_rate": null,
+   "ci95": null,
+   "recent120": {
+    "n": null,
+    "median": null
+   },
+   "note": "No edge",
+   "weak": true,
+   "source": "playbook_v1"
+  }
+ }
+}

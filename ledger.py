@@ -18,6 +18,7 @@ Env: TG_TOKEN, TG_STORE_CHAT.   All numbers come from price APIs, never from the
 PLAN.json: {"direction": "long"|"short", "entry_lo": p, "entry_hi": p, "stop": p, "tps": [{"price": p, "pct": 50}, ...],
  "horizon_days": n, "size_pct": 2.0}   size_pct = % of book; paper trade fills when price trades inside the entry zone,
  exits at stop / take-profits / horizon (same-candle stop+TP counts as stop - conservative)
+  ledger.py handle-scores        per-account track record (7d hit rate / excess, shrunk toward the average) + weight -1/0/+1
   ledger.py alerted-recent       JSON list of leads alerted in the last 14 days (for repeat-alert checks)
   ledger.py notify pull|fetch|other [reason]   send one short fixed-template failure notice to Joseph
   ledger.py add leads.json       add shortlisted leads (list of dicts, see LEAD FIELDS) with entry prices
@@ -35,10 +36,17 @@ RUN RECORD (run.json): {"mode": "full"|"light", "x": {"ok": bool, "captured": n,
  "posts_read": n, "items_read": n, "leads_logged": n, "alerts_sent": ["ASSET", ..],
  "near_misses": [{"asset": "X", "score": 7, "why": "one line"}], "errors": [".."]}
 
-LEAD FIELDS: asset (e.g. "LDO"), kind ("crypto"|"stock"|"other"), cg_id (CoinGecko id, crypto) or
-ticker (Yahoo symbol, stock), score (0-10), components {catalyst,timing,asym,liq,cred},
+LEAD FIELDS: asset (e.g. "LDO"), kind ("crypto"|"stock"|"commodity"|"polymarket"|"other"), cg_id (CoinGecko id,
+crypto) or ticker (Yahoo symbol: stock e.g. MU, commodity future e.g. GC=F) or market_slug + outcome (Polymarket;
+price = that outcome's share price), score (0-10), components {catalyst,timing,asym,liq,cred},
 catalyst_type (listing|unlock|regulatory|earnings|flows|token_sale|macro|partnership|tech_upgrade|
 polymarket|other), direction ("long"|"short"|"watch"), thesis, handles [..], urls [..], alerted (bool)
+EV FIELDS (optional): p_win (0-1, chance the target is hit before the stop within horizon_days), target_pct, stop_pct
+(% move from entry, both positive), horizon_days (default 14), liq_usd (24h $ volume / market liquidity),
+instrument (spot|perp|shares|futures|etf|outcome_shares), funding_ann_pct (perps), ev_pct (the model's own EV).
+The ledger recomputes ev_net_pct = p*target - (1-p)*stop - round-trip costs, records which of target/stop was hit
+first (3-hourly price samples; same sample = stop), and scores calibration (Brier) once resolved.
+Benchmarks: crypto vs BTC, stocks vs SPY, commodities and Polymarket vs cash (excess = raw return).
 """
 import json, os, re, sys, time, urllib.request, urllib.parse, statistics
 from datetime import datetime, timezone, timedelta
@@ -158,17 +166,89 @@ def stock_prices(tickers):
                 time.sleep(3)
     return out
 
+_PM = {}
+def _poly_market(slug):
+    if slug not in _PM:
+        d = http(f"https://gamma-api.polymarket.com/markets?slug={urllib.parse.quote(str(slug))}", headers=UA, timeout=20)
+        _PM[slug] = d[0] if isinstance(d, list) and d else None
+    return _PM[slug]
+
+def _pm_index(m, outcome):
+    oc = [str(x).strip().lower() for x in json.loads(m.get("outcomes") or "[]")]
+    want = str(outcome or "Yes").strip().lower()
+    return oc.index(want) if want in oc else None
+
+def _pm_key(l):
+    return f"pm:{l.get('market_slug')}|{str(l.get('outcome') or 'Yes').strip().lower()}"
+
+def poly_prices(leads):
+    out = {}
+    for l in leads:
+        if not l.get("market_slug") or _pm_key(l) in out: continue
+        for attempt in range(2):
+            try:
+                m = _poly_market(l["market_slug"]); i = _pm_index(m, l.get("outcome")) if m else None
+                if i is not None:
+                    p = float(json.loads(m.get("outcomePrices") or "[]")[i])
+                    if p > 0: out[_pm_key(l)] = p
+                break
+            except Exception:
+                _PM.pop(l["market_slug"], None); time.sleep(3)
+    return out
+
+PRICED_KINDS = ("crypto", "stock", "commodity", "polymarket")
+
 def price_map(leads):
     cg = [l.get("cg_id") for l in leads if l.get("kind") == "crypto"] + ["bitcoin"]
-    st = [l.get("ticker") for l in leads if l.get("kind") == "stock"] + ["SPY"]
-    return crypto_prices(cg), stock_prices(st)
+    st = [l.get("ticker") for l in leads if l.get("kind") in ("stock", "commodity")] + ["SPY"]
+    cp = crypto_prices(cg)
+    cp.update(poly_prices([l for l in leads if l.get("kind") == "polymarket"]))
+    return cp, stock_prices(st)
 
 def px(l, cp, sp):
-    if l.get("kind") == "crypto": return cp.get(l.get("cg_id")), cp.get("bitcoin")
-    if l.get("kind") == "stock": return sp.get(l.get("ticker")), sp.get("SPY")
+    k = l.get("kind")
+    if k == "crypto": return cp.get(l.get("cg_id")), cp.get("bitcoin")
+    if k == "stock": return sp.get(l.get("ticker")), sp.get("SPY")
+    if k == "commodity": return sp.get(l.get("ticker")), None
+    if k == "polymarket": return cp.get(_pm_key(l)), None
     return None, None
 
+BENCH = {"crypto": "BTC", "stock": "SPY", "commodity": "cash", "polymarket": "cash"}
+
+def _cost_rt(l, plan=None, days=0.0, entry=None):
+    """Round-trip trading cost as a fraction of the position: 2 x (fee + slippage by liquidity) + carry
+    (perp funding, charged at |rate| as a conservative assumption; short-stock borrow 1%/yr)."""
+    k = l.get("kind"); liq = _num(l.get("liq_usd"))
+    inst = str((plan or {}).get("instrument") or l.get("instrument") or "").lower()
+    d = str((plan or {}).get("direction") or l.get("direction") or "long")
+    if k == "polymarket":
+        half_spread = 0.005 if liq >= 1e6 else 0.01 if liq >= 1e5 else 0.02          # in share-price terms
+        fee, slip = 0.0, half_spread / max(_num(entry or l.get("entry")) or 0.5, 0.05)
+    elif k == "commodity":
+        fee, slip = 0.0002, 0.0003
+    elif k == "stock":
+        fee, slip = 0.0005, (0.0005 if (not liq or liq >= 5e7) else 0.0015 if liq >= 5e6 else 0.004)
+    else:
+        fee = 0.0005 if "perp" in inst else 0.001
+        slip = 0.003 if not liq else 0.0005 if liq >= 5e8 else 0.001 if liq >= 5e7 else 0.003 if liq >= 5e6 else 0.01
+    carry = 0.0
+    if k == "crypto" and "perp" in inst:
+        carry = abs(_num(l.get("funding_ann_pct")) or 11.0) / 100 * days / 365
+    elif k == "stock" and d == "short":
+        carry = 0.01 * days / 365
+    return round(2 * (fee + slip) + carry, 5)
+
+def _ev(l):
+    p, t, st = _num(l.get("p_win")), _num(l.get("target_pct")), _num(l.get("stop_pct"))
+    if not (0 < p < 1 and t > 0 and st > 0): return None
+    hz = _num(l.get("horizon_days")) or 14
+    return round(100 * (p * t / 100 - (1 - p) * st / 100 - _cost_rt(l, days=hz)), 2)
+
 # ---------- commands ----------
+LEAD_KEYS = ("asset", "kind", "cg_id", "ticker", "market_slug", "outcome", "score", "components", "catalyst_type",
+             "direction", "thesis", "handles", "urls", "p_win", "target_pct", "stop_pct", "horizon_days", "liq_usd",
+             "instrument", "funding_ann_pct", "ev_pct", "regime")
+
 def add(path):
     s = load(); new = json.load(open(path)); cp, sp = price_map(new)
     t = now(); added = merged = 0
@@ -183,18 +263,18 @@ def add(path):
             x["max_score"] = max(x.get("max_score", x["score"]), l.get("score") or 0)
             x["alerted"] = x["alerted"] or bool(l.get("alerted")); merged += 1; continue
         p, b = px(l, cp, sp)
-        s["leads"].append({**{k: l.get(k) for k in ("asset", "kind", "cg_id", "ticker", "score", "components",
-            "catalyst_type", "direction", "thesis", "handles", "urls")},
+        s["leads"].append({**{k: l.get(k) for k in LEAD_KEYS if l.get(k) is not None},
             "id": f"{key}-{t.strftime('%Y%m%d%H%M')}", "alerted": bool(l.get("alerted")), "max_score": l.get("score"),
             "first_seen": t.isoformat(timespec="minutes"), "entry": p, "bench_entry": b,
-            "bench": "BTC" if l.get("kind") == "crypto" else ("SPY" if l.get("kind") == "stock" else None),
+            "bench": BENCH.get(l.get("kind")),
             "status": "open" if p else "untracked", "cp": {}, "mfe": 0.0, "mae": 0.0, "last": p, "last_at": None})
+        if p: s["leads"][-1]["ev_net_pct"] = _ev(s["leads"][-1])
         added += 1
     save(s); print(f"ADD: {added} new, {merged} merged into existing open leads")
 
 def update():
     s = load()
-    retry = [l for l in s["leads"] if l["status"] == "untracked" and l.get("kind") in ("crypto", "stock")
+    retry = [l for l in s["leads"] if l["status"] == "untracked" and l.get("kind") in PRICED_KINDS
              and (now() - datetime.fromisoformat(l["first_seen"])).total_seconds() < 86400]
     if retry:
         cp, sp = price_map(retry)
@@ -202,6 +282,7 @@ def update():
             p, b = px(l, cp, sp)
             if p:
                 l.update(entry=p, bench_entry=b, status="open", entry_late=True, last=p)
+                l["ev_net_pct"] = _ev(l)
     open_ = [l for l in s["leads"] if l["status"] == "open"]
     if not open_:
         try: paper_update(s)
@@ -216,9 +297,10 @@ def update():
         l["mfe"] = round(max(l.get("mfe", 0), r), 4); l["mae"] = round(min(l.get("mae", 0), r), 4)
         l["last"], l["last_at"] = p, t.isoformat(timespec="minutes")
         age_d = (t - datetime.fromisoformat(l["first_seen"])).total_seconds() / 86400
+        _ev_track(l, r, age_d, t)
         for name, days in CHECKPOINTS:
             if name not in l["cp"] and age_d >= days:
-                br = (b / l["bench_entry"] - 1) if (b and l.get("bench_entry")) else None
+                br = 0.0 if l.get("bench") == "cash" else ((b / l["bench_entry"] - 1) if (b and l.get("bench_entry")) else None)
                 l["cp"][name] = {"price": p, "ret": round(r, 4), "bench_ret": round(br, 4) if br is not None else None,
                                  "excess": round(r - sign * br, 4) if br is not None else None, "age_d": round(age_d, 2)}
                 filled.append(f"{l['asset']} {name}: {r:+.1%} (excess {l['cp'][name]['excess']:+.1%})" if br is not None
@@ -227,6 +309,35 @@ def update():
     try: pc = paper_update(s)
     except Exception as e: pc = [f"paper update failed: {str(e)[:60]}"]
     save(s); print(f"UPDATE: {len(open_)} open leads priced; new checkpoints: {filled or 'none'}; paper: {pc or 'no change'}")
+
+def _ev_track(l, r, age_d, t):
+    """Record which of target / stop was reached first; resolve p_win at the first hit or at the horizon."""
+    tg_, st = _num(l.get("target_pct")), _num(l.get("stop_pct"))
+    if not (0 < _num(l.get("p_win")) < 1 and tg_ > 0 and st > 0) or "ev_outcome" in l: return
+    iso = t.isoformat(timespec="minutes")
+    if r <= -st / 100: l["ev_outcome"], l["ev_exit"], l["ev_how"] = 0, -st / 100, "stop"
+    elif r >= tg_ / 100: l["ev_outcome"], l["ev_exit"], l["ev_how"] = 1, tg_ / 100, "target"
+    elif age_d >= (_num(l.get("horizon_days")) or 14):
+        l["ev_outcome"], l["ev_exit"], l["ev_how"] = (1 if r > 0 else 0), round(r, 4), "horizon"
+    else: return
+    l["ev_resolved_at"] = iso
+    l["ev_exit_net"] = round(l["ev_exit"] - _cost_rt(l, days=min(age_d, _num(l.get("horizon_days")) or 14)), 4)
+
+def _calib(L):
+    R = [l for l in L if l.get("ev_outcome") in (0, 1) and 0 < _num(l.get("p_win")) < 1]
+    if not R: return {"n": 0}
+    ps = [_num(l["p_win"]) for l in R]; os_ = [l["ev_outcome"] for l in R]
+    base = sum(os_) / len(os_)
+    out = {"n": len(R), "brier": round(sum((p - o) ** 2 for p, o in zip(ps, os_)) / len(R), 3),
+           "brier_if_base_rate": round(sum((base - o) ** 2 for o in os_) / len(R), 3),
+           "mean_p": round(sum(ps) / len(ps), 2), "hit_rate": round(base, 2),
+           "mean_ev_net_pct": round(statistics.mean([_num(l.get("ev_net_pct")) for l in R]), 2),
+           "mean_realized_net_pct": round(100 * statistics.mean([_num(l.get("ev_exit_net")) for l in R]), 2), "buckets": {}}
+    for lo, hi in ((0, .3), (.3, .5), (.5, .7), (.7, 1.01)):
+        b = [(p, o) for p, o in zip(ps, os_) if lo <= p < hi]
+        if b: out["buckets"][f"p{lo:.1f}-{min(hi, 1):.1f}"] = {"n": len(b), "mean_p": round(sum(p for p, _ in b) / len(b), 2),
+                                                               "hit": round(sum(o for _, o in b) / len(b), 2)}
+    return out
 
 def _grp(rows, keyf, h="7d"):
     g = {}
@@ -249,9 +360,16 @@ def stats():
         "by_component": {c: _grp(L, lambda l, c=c: (l.get("components") or {}).get(c)) for c in ("catalyst", "timing", "asym", "liq", "cred")},
         "by_handle_top": dict(sorted(_grp(L, lambda l: l.get("handles") or ["?"]).items(), key=lambda kv: -kv[1]["n"])[:25]),
         "multi_mention": _grp(L, lambda l: "re-mentioned" if l.get("mentions") else "single"),
-        "by_decision": _grp([l for l in L if l.get("alerted")], lambda l: l.get("decision") or "no_answer")}
+        "by_decision": _grp([l for l in L if l.get("alerted")], lambda l: l.get("decision") or "no_answer"),
+        "by_joseph_feedback": _grp([l for l in L if l.get("feedback")], lambda l: l.get("feedback")),
+        "by_regime": _grp(L, lambda l: l.get("regime") or "unknown")}
+    out["calibration"] = _calib(L)
+    fb = [f for f in s.get("feedback", []) if isinstance(f, dict)]
+    out["near_miss_feedback"] = {"useful": sum(f.get("vote") == "useful" for f in fb), "noise": sum(f.get("vote") == "noise" for f in fb),
+                                 "recent": [f"{f.get('asset')} {_num(f.get('score')):g}/10 {f.get('vote')}" for f in fb[-12:]]}
     cl = [l for l in L if (l.get("paper") or {}).get("state") == "closed"]
     out["paper"] = {"closed": len(cl), "book_pnl_pct": round(sum(l["paper"].get("book_pnl_pct", 0) for l in cl), 3),
+                    "costs_book_pct": round(sum(l["paper"].get("costs_pct", 0) * l["plan"].get("size_pct", 0) for l in cl if l.get("plan")), 3),
                     "win_rate": round(sum(1 for l in cl if l["paper"].get("pnl_pct", 0) > 0) / len(cl), 2) if cl else None,
                     "by_exit": {k: sum(1 for l in cl if l["paper"].get("exit_reason") == k) for k in ("stop", "targets", "horizon")}}
     print(json.dumps(out, ensure_ascii=False, indent=1))
@@ -277,6 +395,12 @@ def brief():
     a7 = [((l.get("cp") or {}).get("7d") or {}).get("excess") for l in L if l.get("alerted")]
     a7 = [x for x in a7 if x is not None]
     if a7: lines.append(f"Alert track record: n={len(a7)} 7d median excess {statistics.median(a7):+.1%}, hit {sum(x>0 for x in a7)/len(a7):.0%}")
+    c = _calib(L)
+    lines.append(f"Probability calibration: n={c['n']} resolved, you said {c['mean_p']:.0%} on average, actual hit {c['hit_rate']:.0%}, "
+                 f"Brier {c['brier']} (base-rate guess {c['brier_if_base_rate']}); mean EV {c['mean_ev_net_pct']:+.1f}% vs realized {c['mean_realized_net_pct']:+.1f}%"
+                 if c["n"] else "Probability calibration: no resolved p_win leads yet")
+    fb = [f for f in s.get("feedback", []) if isinstance(f, dict)][-8:]
+    if fb: lines.append("Joseph's near-miss feedback (latest): " + "; ".join(f"{f.get('asset')} {_num(f.get('score')):g}/10 {f.get('vote')}" for f in fb))
     print("\n".join(lines))
 
 def mark_alerted(asset):
@@ -315,7 +439,7 @@ def _valid_plan(p):
         if d == "long" and not (st < lo and all(tp > hi for tp, _ in tps)): return None
         if d == "short" and not (st > hi and all(tp < lo for tp, _ in tps)): return None
         return {"direction": d, "entry_lo": lo, "entry_hi": hi, "stop": st, "tps": sorted(tps, reverse=(d == "short")) if d == "short" else sorted(tps),
-                "horizon_days": hz, "size_pct": sz}
+                "horizon_days": hz, "size_pct": sz, "instrument": re.sub(r"[^a-z_ ]", "", str(p.get("instrument") or "").lower())[:20]}
     except Exception:
         return None
 
@@ -376,6 +500,18 @@ def poll_replies():
         if not cq: continue
         act, _, cid = str(cq.get("data", "")).partition(":")
         note = "Not recorded"
+        if str((cq.get("from") or {}).get("id")) == str(ALERT_CHAT) and act == "nm":
+            h, _, v = cid.partition(":"); e = (s.get("nm_index") or {}).get(h)
+            if e and v in ("u", "d"):
+                vote = "useful" if v == "u" else "noise"
+                fb = [f for f in s.get("feedback", []) if isinstance(f, dict) and f.get("h") != h]
+                fb.append({"h": h, "asset": e.get("asset"), "score": e.get("score"), "day": e.get("day"), "vote": vote,
+                           "at": now().isoformat(timespec="minutes")})
+                s["feedback"] = fb[-300:]
+                cands = [l for l in s["leads"] if str(l.get("asset", "")).upper() == str(e.get("asset", "")).upper()
+                         and str(l.get("first_seen", ""))[:10] <= str(e.get("day") or "9")]
+                if cands: max(cands, key=lambda l: l["first_seen"])["feedback"] = vote
+                n += 1; note = f"Recorded: {e.get('asset')} {vote}"
         if str((cq.get("from") or {}).get("id")) == str(ALERT_CHAT) and act in ("took", "skip"):
             for l in s["leads"]:
                 if l.get("cb") == cid or l["id"] == cid:
@@ -408,7 +544,15 @@ def _candles(l, since):
                 out = [(p[0] / 1000, p[1], p[1], p[1], p[1]) for p in d.get("prices", [])]
             except Exception:
                 return None
-    elif l.get("kind") == "stock" and l.get("ticker"):
+    elif l.get("kind") == "polymarket" and l.get("market_slug"):
+        try:
+            m = _poly_market(l["market_slug"]); i = _pm_index(m, l.get("outcome"))
+            tok = json.loads(m.get("clobTokenIds") or "[]")[i]
+            d = http(f"https://clob.polymarket.com/prices-history?market={tok}&startTs={int(since)}&endTs={int(time.time())}&fidelity=60", headers=UA)
+            out = [(float(h["t"]), float(h["p"]), float(h["p"]), float(h["p"]), float(h["p"])) for h in d.get("history", [])]
+        except Exception:
+            return None
+    elif l.get("kind") in ("stock", "commodity") and l.get("ticker"):
         try:
             d = http(f"https://query2.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(l['ticker'])}?period1={int(since)}&period2={int(time.time())}&interval=60m",
                      headers={"User-Agent": "Mozilla/5.0"})
@@ -433,9 +577,8 @@ def _sim_lead(l):
             if pp["state"] == "open":   # no data after the horizon: close at the last known mark
                 pp["realized"] = pp.get("mark", pp.get("realized", 0.0)); pp["fills"].append(["time_nodata", None, pp.get("remaining", 0)])
                 pp.update(state="closed", remaining=0.0, exit_reason="horizon (no data)")
-                pp["pnl_pct"] = round(pp["realized"], 4); pp["book_pnl_pct"] = round(pp["realized"] * plan["size_pct"], 4)
-                pp["reported"] = True; pp["closed_at"] = now().isoformat(timespec="minutes")
-                return f"{l['asset']} closed at last mark (no price data) {pp['pnl_pct']:+.1%}"
+                _book(l, pp, plan, time.time())
+                return f"{l['asset']} closed at last mark (no price data) {pp['pnl_pct']:+.1%} after costs"
         return None
     long_ = plan["direction"] == "long"
     for ts, o, h, lo, c in cs:
@@ -473,10 +616,18 @@ def _sim_lead(l):
             pp["mark"] = pp["realized"] + pp["remaining"] / 100 * ret(c)
             pp["last_ts"] = ts
     if pp.get("state") == "closed" and "reported" not in pp:
-        pp["pnl_pct"] = round(pp["realized"], 4); pp["book_pnl_pct"] = round(pp["realized"] * plan["size_pct"], 4); pp["reported"] = True
-        pp["closed_at"] = now().isoformat(timespec="minutes")
-        return f"{l['asset']} closed ({pp['exit_reason']}) {pp['pnl_pct']:+.1%} = {pp['book_pnl_pct']:+.2f}% of book"
+        _book(l, pp, plan, pp.get("last_ts") or time.time())
+        return f"{l['asset']} closed ({pp['exit_reason']}) {pp['pnl_pct']:+.1%} after {pp['costs_pct']:.2%} costs = {pp['book_pnl_pct']:+.2f}% of book"
     return None
+
+def _book(l, pp, plan, end_ts):
+    """Final P/L of a closed paper trade, net of fees, slippage and carry."""
+    days = max(0.0, (end_ts - (pp.get("entry_ts") or end_ts)) / 86400)
+    pp["gross_pnl_pct"] = round(pp["realized"], 4)
+    pp["costs_pct"] = _cost_rt(l, plan, days, pp.get("entry"))
+    pp["pnl_pct"] = round(pp["realized"] - pp["costs_pct"], 4)
+    pp["book_pnl_pct"] = round(pp["pnl_pct"] * plan["size_pct"], 4)
+    pp["reported"] = True; pp["closed_at"] = now().isoformat(timespec="minutes")
 
 def paper_update(s):
     changed = []
@@ -576,6 +727,32 @@ def handles(save_it=False):
         rep["id"] = f"{out['month']}:{hash(json.dumps(rep, sort_keys=True)) & 0xffff}"
         s["handles_report"] = rep; save(s)
 
+def handle_scores(K=5):
+    """Per-account 7d track record, shrunk toward the all-lead average with K pseudo-results, and a weight for scoring."""
+    s = load(); rows = []
+    for l in s.get("leads", []):
+        ex = ((l.get("cp") or {}).get("7d") or {}).get("excess") if isinstance(l.get("cp"), dict) else None
+        if isinstance(ex, (int, float)): rows.append((l, ex))
+    if not rows: print("Handle track records: no 7-day results yet - every account has weight 0"); return
+    base_hit = sum(ex > 0 for _, ex in rows) / len(rows); base_mean = statistics.mean(ex for _, ex in rows)
+    per = {}
+    for l, ex in rows:
+        hs = _norm_handles(l.get("handles"))
+        for m in _list(l.get("mentions")):
+            if isinstance(m, dict): hs |= _norm_handles(m.get("handles"))
+        for h in hs: per.setdefault(h, {}).setdefault(str(l.get("asset")).upper(), ex)
+    out = []
+    for h, d in per.items():
+        xs = list(d.values()); n = len(xs); k = sum(x > 0 for x in xs)
+        hs_, es = (k + K * base_hit) / (n + K), (sum(xs) + K * base_mean) / (n + K)
+        w = (1 if hs_ >= base_hit + 0.1 else -1 if hs_ <= base_hit - 0.1 else 0) if n >= 4 else 0
+        out.append((n, h, k, hs_, statistics.mean(xs), es, w))
+    lines = [f"Handle track records (7d excess, one result per asset; all leads: n={len(rows)}, hit {base_hit:.0%}, mean {base_mean:+.1%}; "
+             f"shrunk with {K} average pseudo-results; weight needs n>=4; unlisted accounts = weight 0)"]
+    for n, h, k, hs_, m, es, w in sorted(out, key=lambda r: (-abs(r[6]), -r[0]))[:20]:
+        lines.append(f"@{h} n={n} hit {k}/{n} (shrunk {hs_:.0%}) mean {m:+.1%} (shrunk {es:+.1%}) weight {w:+d}")
+    print("\n".join(lines))
+
 RUNS_PER_DAY = 8          # scheduled at 02:45, 05:45 ... 23:45 JST
 DIGEST_AFTER_JST_HOUR = 20  # first run at/after 20:30 JST sends the digest; a later run retries if it failed
 
@@ -662,7 +839,7 @@ def digest(send=False, if_due=False):
     if serr: problems.append("source errors: " + ", ".join(serr))
     errs = [str(e) for r in runs for e in _list(r.get("errors"))]
     if errs: problems.append(f"{len(errs)} run error(s): " + "; ".join(errs[:3])[:300])
-    unpriced = [l.get("asset") for l in L if l.get("status") == "untracked" and l.get("kind") in ("crypto", "stock")
+    unpriced = [l.get("asset") for l in L if l.get("status") == "untracked" and l.get("kind") in PRICED_KINDS
                 and dt(l.get("first_seen", "")) and (t - dt(l["first_seen"])).total_seconds() < 86400]
     if unpriced: problems.append("no price source for: " + ", ".join(map(str, unpriced[:6])))
     posts = int(sum(_num(r.get("posts_read")) for r in runs)); items = int(sum(_num(r.get("items_read")) for r in runs))
@@ -683,9 +860,18 @@ def digest(send=False, if_due=False):
     lines.append(f"Runs {len(got & exp) if exp else len(runs)}/{len(exp) or RUNS_PER_DAY} ({full} full analysis) | X posts read {posts} | source items {items}")
     new_leads = sum(1 for l in L if dt(l.get("first_seen", "")) and (t - dt(l["first_seen"])).total_seconds() < 81000)
     lines.append(f"Leads logged {leads} ({new_leads} new, the rest re-mentions of tracked leads) | alerts sent {len(alerts)}" + (f" ({', '.join(alerts)})" if alerts else ""))
+    kb = []
     if near:
-        lines.append("Near-misses (not alerted):")
-        lines += [f"- {m.get('asset')} {_num(m.get('score')):g}/10: {_clip(m.get('why'), 150)}" for m in near[:3]]
+        import hashlib
+        lines.append("Near-misses (not alerted) - tap 👍/👎 below so the scout learns what you value:")
+        idx = s.get("nm_index") if isinstance(s.get("nm_index"), dict) else {}
+        for m in near[:3]:
+            lines.append(f"- {m.get('asset')} {_num(m.get('score')):g}/10: {_clip(m.get('why'), 150)}")
+            h = hashlib.sha1(f"{day}|{str(m.get('asset')).upper()}".encode()).hexdigest()[:10]
+            idx[h] = {"asset": str(m.get("asset")), "score": _num(m.get("score")), "day": day, "why": _clip(m.get("why"), 120)}
+            a = _clip(m.get("asset"), 14)
+            kb.append([{"text": f"👍 {a} useful", "callback_data": f"nm:{h}:u"}, {"text": f"👎 {a} noise", "callback_data": f"nm:{h}:d"}])
+        s["nm_index"] = dict(list(idx.items())[-90:])
     def ret(l): return (l["last"] / l["entry"] - 1) * (-1 if l.get("direction") == "short" else 1)
     o = [l for l in L if l.get("status") == "open" and l.get("entry") and l.get("last")]
     mv = sorted([l for l in o if abs(ret(l)) >= 0.005], key=lambda l: -abs(ret(l)))[:4]
@@ -714,11 +900,24 @@ def digest(send=False, if_due=False):
         lines.append(f"Monthly X account review (details in Drive): follow {', '.join('@' + h for h in hr.get('follow', [])) or 'none'}; "
                      f"unfollow {', '.join('@' + h for h in hr.get('unfollow', [])) or 'none'}; noisy {', '.join('@' + h for h in hr.get('noisy', [])[:5]) or 'none'}")
         if send or if_due: s["handles_reported"] = hr.get("id")
+    ms = s.get("miss_stats") if isinstance(s.get("miss_stats"), dict) else {}
+    mn, mc = ms.get("n") or {}, ms.get("caught") or {}
+    if _num(mn.get("all")):
+        parts = [f"{lab} {int(_num(mc.get(k)))}/{int(_num(mn.get(k)))}" for k, lab in
+                 (("crypto", "crypto"), ("stock", "stocks"), ("commodity", "commodities"), ("polymarket", "Polymarket")) if _num(mn.get(k))]
+        lines.append(f"Miss log ({ms.get('days')}d): flagged {int(_num(mc.get('all')))}/{int(_num(mn.get('all')))} big moves beforehand "
+                     f"({', '.join(parts)})" + (f" | score>=7 leads that then moved: {ms.get('precision_hits')}/{ms.get('precision_n')}" if ms.get("precision_n") else ""))
+    c = _calib(L)
+    if c["n"]: lines.append(f"Calibration: {c['n']} resolved, predicted {c['mean_p']:.0%} vs actual {c['hit_rate']:.0%} (Brier {c['brier']})")
+    fb = [f for f in s.get("feedback", []) if isinstance(f, dict)]
+    if fb: lines.append(f"Your near-miss feedback so far: 👍 {sum(f.get('vote') == 'useful' for f in fb)} / 👎 {sum(f.get('vote') == 'noise' for f in fb)}")
     lines.append(f"Ledger {len(L)} leads ({sum(l.get('status') == 'open' for l in L)} open) | playbook {'active' if s.get('playbook') else 'empty (learning)'}")
     text = "\n".join(lines); print(text)
     if send or if_due:
         try:
-            r = tg("sendMessage", chat_id=ALERT_CHAT, text=text[:3900], disable_web_page_preview="true")
+            params = {"chat_id": ALERT_CHAT, "text": text[:3900], "disable_web_page_preview": "true"}
+            if kb: params["reply_markup"] = json.dumps({"inline_keyboard": kb})
+            r = tg("sendMessage", **params)
             if r.get("ok"):
                 s["last_digest"] = day; save(s); print("DIGEST: sent")
         except Exception as e:
@@ -760,5 +959,8 @@ if __name__ == "__main__":
         try: handles("--save" in sys.argv)
         except Exception as e: print(f"HANDLES FAILED (continuing): {str(e)[:120]}")
     elif cmd == "alerted-recent": alerted_recent()
+    elif cmd == "handle-scores":
+        try: handle_scores()
+        except Exception as e: print(f"HANDLE-SCORES FAILED (continuing): {str(e)[:120]}")
     elif cmd == "notify": notify(sys.argv[2], " ".join(sys.argv[3:]))
     else: print(__doc__)
