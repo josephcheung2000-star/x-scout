@@ -228,7 +228,7 @@ def prep(d, slot):
     extra = {}
     for key, cmd in (("LEDGER BRIEF", ["brief"]), ("PLAYBOOK", ["playbook"]), ("ALERTED IN LAST 14 DAYS", ["alerted-recent"]),
                      ("HANDLE TRACK RECORDS (use the weight in scoring)", ["handle-scores"])) + \
-            ((("LEDGER STATS", ["stats"]), ("PAPER PORTFOLIO", ["paper"])) if sweep else ()) + \
+            ((("LEDGER STATS", ["stats"]), ("PAPER PORTFOLIO", ["paper"]), ("SHADOW TEST SCORECARD (pre-registered, 2026-09-27 to 2026-11-27)", ["shadow"])) if sweep else ()) + \
             ((("MONTHLY ACCOUNT REVIEW (saved for the digest)", ["handles", "--save"]),) if sweep and slot.day == 1 else ()):
         rc, out = sh(["ledger.py"] + cmd, timeout=300)
         extra[key] = out.strip() if rc == 0 else f"(failed: exit {rc})"

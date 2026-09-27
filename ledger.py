@@ -759,6 +759,38 @@ def handle_scores(K=5):
         lines.append(f"@{h} n={n} hit {k}/{n} (shrunk {hs_:.0%}) mean {m:+.1%} (shrunk {es:+.1%}) weight {w:+d}")
     print("\n".join(lines))
 
+SHADOW_START, SHADOW_END = "2026-09-27", "2026-11-27"   # pre-registered live shadow test (see README)
+
+def _book_stats(rs):
+    if not rs: return {"n": 0}
+    rs = sorted(rs, key=lambda l: str(l.get("ev_resolved_at") or ""))
+    net = [_num(l.get("ev_exit_net")) for l in rs]
+    R = [n / (_num(l.get("stop_pct")) / 100) for n, l in zip(net, rs)]
+    cum = peak = dd = 0.0
+    for r in R:
+        cum += r; peak = max(peak, cum); dd = max(dd, peak - cum)
+    c = _calib(rs)
+    return {"n": len(rs), "hit": round(sum(x > 0 for x in net) / len(net), 2), "mean_net_pct": round(100 * statistics.mean(net), 2),
+            "total_R": round(sum(R), 2), "max_dd_R": round(dd, 2), "brier": c.get("brier"), "brier_base": c.get("brier_if_base_rate")}
+
+def shadow():
+    """Live shadow-test scorecard: leads found since SHADOW_START, resolved at target / stop / horizon, net of costs."""
+    L = load().get("leads", [])
+    live = [l for l in L if str(l.get("first_seen", "")) >= SHADOW_START and l.get("direction") in ("long", "short")
+            and _num(l.get("stop_pct")) > 0 and _num(l.get("target_pct")) > 0]
+    done = [l for l in live if l.get("ev_outcome") in (0, 1)]
+    out = {"start": SHADOW_START, "end": SHADOW_END, "leads_with_levels": len(live), "resolved": len(done),
+           "ALERTS": _book_stats([l for l in done if l.get("alerted")]),
+           "LEADS6": _book_stats([l for l in done if _num(l.get("max_score") or l.get("score")) >= 6])}
+    a = out["ALERTS"]; prim = a if a.get("n", 0) >= 10 else out["LEADS6"]
+    crit = {"mean_net_gt_0": prim.get("mean_net_pct", -1) > 0,
+            "totalR_gt_0_and_dd_lt_10R": prim.get("total_R", -1) > 0 and prim.get("max_dd_R", 99) < 10,
+            "brier_lt_base": (prim.get("brier") is not None and prim.get("brier_base") is not None and prim["brier"] < prim["brier_base"])}
+    out["primary_book"] = "ALERTS" if prim is a else "LEADS6 (fallback: alerts n<10)"
+    out["criteria"] = crit
+    out["verdict"] = "INCONCLUSIVE (n<10)" if prim.get("n", 0) < 10 else ("PASS" if all(crit.values()) else "FAIL")
+    return out
+
 RUNS_PER_DAY = 8          # scheduled at 02:45, 05:45 ... 23:45 JST
 DIGEST_AFTER_JST_HOUR = 20  # first run at/after 20:30 JST sends the digest; a later run retries if it failed
 
@@ -906,6 +938,17 @@ def digest(send=False, if_due=False):
         lines.append(f"Monthly X account review (details in Drive): follow {', '.join('@' + h for h in hr.get('follow', [])) or 'none'}; "
                      f"unfollow {', '.join('@' + h for h in hr.get('unfollow', [])) or 'none'}; noisy {', '.join('@' + h for h in hr.get('noisy', [])[:5]) or 'none'}")
         if send or if_due: s["handles_reported"] = hr.get("id")
+    try:
+        sh = shadow(); final = day >= SHADOW_END
+        if final and s.get("shadow_final") != SHADOW_END or (not final and tj.weekday() == 0):
+            a, b = sh["ALERTS"], sh["LEADS6"]
+            f = lambda x: (f"n={x['n']}, hit {x['hit']:.0%}, mean {x['mean_net_pct']:+.1f}% net, {x['total_R']:+.1f}R, max DD {x['max_dd_R']:.1f}R"
+                           if x.get("n") else "n=0")
+            lines.append(("SHADOW TEST FINAL VERDICT: " + sh["verdict"] if final else f"Shadow test (to {SHADOW_END})") +
+                         f" | alerts {f(a)} | leads>=6 {f(b)}" + (f" | criteria {sh['criteria']}" if final else ""))
+            if final and (send or if_due): s["shadow_final"] = SHADOW_END
+    except Exception as e:
+        lines.append(f"Shadow scorecard failed: {str(e)[:60]}")
     ms = s.get("miss_stats") if isinstance(s.get("miss_stats"), dict) else {}
     mn, mc = ms.get("n") or {}, ms.get("caught") or {}
     if _num(mn.get("all")):
@@ -965,6 +1008,7 @@ if __name__ == "__main__":
         try: handles("--save" in sys.argv)
         except Exception as e: print(f"HANDLES FAILED (continuing): {str(e)[:120]}")
     elif cmd == "alerted-recent": alerted_recent()
+    elif cmd == "shadow": print(json.dumps(shadow(), indent=1))
     elif cmd == "handle-scores":
         try: handle_scores()
         except Exception as e: print(f"HANDLE-SCORES FAILED (continuing): {str(e)[:120]}")
