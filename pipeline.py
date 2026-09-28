@@ -301,9 +301,11 @@ def prep(d, slot):
     L += ["", "END OF INPUT"]
     text = "\n".join(L)
     parts, cur = [], ""
+    blen = lambda s: len(s.encode("utf-8"))                   # the reader truncates by size, and CJK text is 3 bytes/char
     for line in L:                                             # split on line boundaries, never mid-post
-        line = line[:PART_CHARS - 200]
-        if cur and len(cur) + len(line) + 1 > PART_CHARS:
+        while blen(line) > PART_CHARS - 200:
+            line = line[:-50]
+        if cur and blen(cur) + blen(line) + 1 > PART_CHARS:
             parts.append(cur); cur = ""
         cur += line + "\n"
     parts.append(cur)
