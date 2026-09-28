@@ -32,3 +32,9 @@ This repo is public: scripts only, no credentials, no data. The Actions logs pri
 - `ledger.py`: lead kinds commodity (Yahoo futures ticker) and polymarket (market_slug + outcome); EV fields (p_win, target,
   stop, horizon) with target-vs-stop resolution and Brier calibration; paper trades net of fees, slippage and funding;
   per-account track records with shrinkage (`handle-scores`); 👍/👎 buttons on digest near-misses (`poll-replies`).
+
+## Research rounds (2026-09-28) - see family_stats.json
+- Families with negative backtested expectancy never alert (pipeline guard): unlock shorts, insider-buy longs, funding fades, macro fades.
+- Alerts need a perp venue for crypto shorts (Binance/Bybit/OKX/Hyperliquid, checked live) and are blocked on an asset alerted in the last 14 days.
+- Listing/perp-launch fades use 20% target / 10% stop / 14 days; p_win and EV come from the family stats where available.
+- Shadow test restarted: 2026-09-28 .. 2026-11-28.

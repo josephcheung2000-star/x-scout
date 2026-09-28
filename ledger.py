@@ -250,7 +250,7 @@ def _ev(l):
 # ---------- commands ----------
 LEAD_KEYS = ("asset", "kind", "cg_id", "ticker", "market_slug", "outcome", "score", "components", "catalyst_type",
              "direction", "thesis", "handles", "urls", "p_win", "target_pct", "stop_pct", "horizon_days", "liq_usd",
-             "instrument", "funding_ann_pct", "ev_pct", "regime")
+             "instrument", "funding_ann_pct", "ev_pct", "regime", "family")
 
 def add(path):
     s = load(); new = json.load(open(path)); cp, sp = price_map(new)
@@ -759,7 +759,7 @@ def handle_scores(K=5):
         lines.append(f"@{h} n={n} hit {k}/{n} (shrunk {hs_:.0%}) mean {m:+.1%} (shrunk {es:+.1%}) weight {w:+d}")
     print("\n".join(lines))
 
-SHADOW_START, SHADOW_END = "2026-09-27", "2026-11-27"   # pre-registered live shadow test (see README)
+SHADOW_START, SHADOW_END = "2026-09-28", "2026-11-28"   # pre-registered live shadow test, restarted after the 2026-09-28 rule changes
 
 def _book_stats(rs):
     if not rs: return {"n": 0}
