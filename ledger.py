@@ -416,8 +416,8 @@ def mark_alerted(asset):
 
 def alerted_recent(days=14):
     s = load(); t = now()
-    rows = [l for l in s["leads"] if l.get("alerted") and l.get("first_seen")
-            and (t - datetime.fromisoformat(l["first_seen"])).total_seconds() < days * 86400]
+    rows = [l for l in s["leads"] if l.get("alerted") and (l.get("alerted_at") or l.get("first_seen"))
+            and (t - datetime.fromisoformat(l.get("alerted_at") or l["first_seen"])).total_seconds() < days * 86400]
     print(json.dumps([{"asset": l["asset"], "first_seen": l["first_seen"], "thesis": l.get("thesis"), "score": l.get("score")} for l in rows], ensure_ascii=False))
 
 # ---------- alerts with buttons + paper portfolio ----------
@@ -759,7 +759,7 @@ def handle_scores(K=5):
         lines.append(f"@{h} n={n} hit {k}/{n} (shrunk {hs_:.0%}) mean {m:+.1%} (shrunk {es:+.1%}) weight {w:+d}")
     print("\n".join(lines))
 
-SHADOW_START, SHADOW_END = "2026-09-28", "2026-11-28"   # pre-registered live shadow test, restarted after the 2026-09-28 rule changes
+SHADOW_START, SHADOW_END = "2026-09-28T02:00", "2026-11-28"   # pre-registered live shadow test, restarted after the 2026-09-28 rule changes
 
 def _book_stats(rs):
     if not rs: return {"n": 0}

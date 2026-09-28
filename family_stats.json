@@ -1,8 +1,9 @@
-{"_about": "Backtest 2026-09-28 (research rounds). Exit rule 20% target / 10% stop / 14 days unless noted, net of costs. Samples: 12 months before 2026-07-28 (PRE) + 2026-07-28..09-05 (DEV); llm_* rows are the replayed Claude leads (own levels).",
- "krw_listing_fade": {"what": "short a coin on its first Upbit or Bithumb KRW listing day (perp venue required)", "n": 117, "target_hit": 0.496, "stop_hit": 0.402, "mean_net": 0.0506, "median_net": 0.136, "win": 0.564, "alert_ok": true},
- "coinbase_listing_fade": {"what": "short a coin on its Coinbase listing", "n": 39, "target_hit": 0.333, "stop_hit": 0.59, "mean_net": 0.0054, "median_net": -0.103, "win": 0.41, "alert_ok": true},
- "unlock_short_7d": {"what": "short ~7 days before a >=2% cliff unlock", "n": 116, "target_hit": 0.198, "stop_hit": 0.586, "mean_net": -0.022, "median_net": -0.1047, "win": 0.336, "alert_ok": false},
- "llm_insider_long": {"what": "Claude's insider-buy longs", "n": 30, "target_hit": 0.133, "stop_hit": 0.633, "mean_net": -0.0275, "median_net": -0.052, "win": 0.233, "alert_ok": false},
- "llm_funding_short": {"what": "Claude's crowded-funding fades", "n": 21, "target_hit": 0.19, "stop_hit": 0.714, "mean_net": -0.06, "median_net": -0.0628, "win": 0.19, "alert_ok": false},
- "llm_macro_short": {"what": "Claude's macro / commodity fades", "n": 15, "target_hit": 0.2, "stop_hit": 0.733, "mean_net": -0.0184, "median_net": -0.041, "win": 0.267, "alert_ok": false},
- "llm_flows_long": {"what": "Claude's ETF-flow longs", "n": 8, "target_hit": 0.25, "stop_hit": 0.5, "mean_net": -0.0042, "median_net": -0.0176, "win": 0.5, "alert_ok": true}}
+{"_about": "Research rounds 2026-09-28, audited. PRE = ~10 months before 2026-07-28 (in-sample: the priors were fit on it); DEV = 2026-07-28..09-05 (out of sample); HOLDOUT = 09-06..09-25 (seen during research, so not clean). Mean net per trade after costs. No family has a proven out-of-sample edge; the live shadow test (2026-09-28..11-28) is the only clean evidence.",
+ "krw_listing_fade": {"what": "short a coin after its first Upbit/Bithumb KRW listing", "pre": "n=100, +2.4% (10/5/7 exits), +6.0% (20/10/14)", "dev": "n=17, +0.5% / -0.3%", "holdout": "n=2, -10.3%", "status": "unproven: worked before the test window, flat in it", "may_alert": true},
+ "coinbase_listing_fade": {"what": "short a coin on its Coinbase listing", "pre": "n=38, -0.8%", "status": "no edge", "may_alert": true},
+ "perp_launch_fade": {"what": "short into a new Binance perp launch", "status": "not backtested (prior n=24, CI spans 0)", "may_alert": true},
+ "unlock_short": {"what": "short ahead of a >=2% cliff unlock", "pre": "n=63, -1.0%", "dev": "n=53, -1.9%", "status": "loses", "may_alert": false},
+ "insider_long": {"what": "long after insider buys", "dev": "n=30 (25 assets), -2.8%", "status": "loses", "may_alert": false},
+ "funding_fade": {"what": "short a crowded positive-funding coin", "dev": "n=21 (7 after 14-day dedup), -6.0%", "status": "loses", "may_alert": false},
+ "macro_fade": {"what": "short side of macro / commodity shocks", "dev": "n=15 (8 after dedup), -1.8%", "status": "loses", "may_alert": false},
+ "flows_long": {"what": "long after big ETF inflows", "dev": "n=8 (4 after dedup), -0.4%", "status": "too few to tell", "may_alert": true}}

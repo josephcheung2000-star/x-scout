@@ -11,7 +11,7 @@ Every 10 minutes the workflow runs `python3 pipeline.py tick`, which does two th
         -> digest if due -> ledger push -> rename the file "DONE XS-OUT ..."
 Env (repo secrets): X_AUTH_TOKEN, X_CT0, TG_TOKEN, TG_STORE_CHAT, TG_ALERT_CHAT, GWS_DRIVE (authorized_user JSON).
 The repo is public, so this script prints only counts and status words - never post text, leads or tokens."""
-import json, os, re, subprocess, sys, time, datetime, urllib.request
+import json, os, re, subprocess, sys, time, datetime, urllib.request, urllib.error
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaInMemoryUpload
@@ -235,10 +235,8 @@ def prep(d, slot):
     extra["BACKTESTED PRIORS (v2; base rates per catalyst type - they supersede PLAYBOOK PRIORS where both cover a type)"] = priors_text()
     try:
         fs = json.load(open("family_stats.json"))
-        extra["STRATEGY FAMILY STATS (backtest 2026-09-28; use for p_win and EV; alert_ok=false families never alert)"] = "\n".join(
-            [fs.get("_about", "")] + [f"{k}: {v.get('what')} | n={v['n']} target-hit {v['target_hit']:.0%} stop-hit {v['stop_hit']:.0%} "
-             f"mean net {v['mean_net']:+.1%} median {v['median_net']:+.1%} win {v['win']:.0%} | alert_ok={v.get('alert_ok')}"
-             for k, v in fs.items() if isinstance(v, dict)])
+        extra["STRATEGY FAMILY STATS (research 2026-09-28; may_alert=false families never alert; context for p_win, not a substitute)"] = "\n".join(
+            [fs.get("_about", "")] + [f"{k}: " + " | ".join(f"{a}: {b}" for a, b in v.items()) for k, v in fs.items() if isinstance(v, dict)])
     except Exception:
         extra["STRATEGY FAMILY STATS"] = "(family_stats.json unreadable)"
     reg = [r for r in (s2.get("regime") or []) if isinstance(r, dict) and "error" not in r]
@@ -348,60 +346,82 @@ def priors_text():
     return "\n".join(out) or "(no priors)"
 
 
-# ---------------------------------------------------------------- ALERT GUARDS (backtest rounds, 2026-09-28)
-# Families whose 12-month + 60-day backtest expectancy is negative never alert (they stay leads): unlock shorts
-# (n=116, -2.2%/trade), insider-buy longs (n=30, -2.8%), funding fades (n=21, -6.0%), macro shorts (n=15, -1.8%).
-NEG_FAMILIES = {"unlock", "insider", "funding", "macro"}
+# ---------------------------------------------------------------- ALERT GUARDS (research rounds 2026-09-28, audited)
+# Families that lost money in the backtest never alert (they stay leads): see family_stats.json.
+NEG_FAMILY_TAGS = {"unlock_short", "unlock_short_7d", "insider_long", "funding_fade", "macro_fade"}
+NEG_PAIRS = {("unlock", "short"), ("insider", "long"), ("funding", "short"), ("macro", "short")}
 COOLDOWN_DAYS = 14
 _HL = None
 
+def _dir(x):
+    x = str(x or "").strip().lower()
+    return {"sell": "short", "buy": "long"}.get(x, x)
+
 def perp_venues(sym):
-    """Perp venues listing SYM-USDT(-ish) right now: Binance, Bybit, OKX, Hyperliquid. Errors = venue unknown."""
+    """(venues found, venues that could not be checked). Binance/Bybit often refuse US cloud IPs: an error counts as unknown."""
     global _HL
-    sym = re.sub(r"[^A-Z0-9]", "", str(sym).upper())
-    if not sym: return []
-    out = []
+    sym = re.sub(r"[^A-Za-z0-9]", "", str(sym)).upper()
+    found, unknown = [], []
+    if not sym: return found, ["all"]
+    class NotListed(Exception):
+        pass
     def get(u):
-        return json.loads(urllib.request.urlopen(urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"}), timeout=15).read())
-    for name, u, ok in (("binance", f"https://fapi.binance.com/fapi/v1/exchangeInfo?symbol={sym}USDT",
-                         lambda d: any(x.get("symbol") == sym + "USDT" and x.get("status") == "TRADING" for x in d.get("symbols", []))),
-                        ("bybit", f"https://api.bybit.com/v5/market/instruments-info?category=linear&symbol={sym}USDT",
-                         lambda d: any(x.get("symbol") == sym + "USDT" and x.get("status") == "Trading" for x in (d.get("result") or {}).get("list", []))),
-                        ("okx", f"https://www.okx.com/api/v5/public/instruments?instType=SWAP&instFamily={sym}-USDT",
-                         lambda d: any(x.get("instFamily") == sym + "-USDT" and x.get("state") == "live" for x in d.get("data", [])))):
         try:
-            if ok(get(u)): out.append(name)
-        except Exception:
-            pass
+            return json.loads(urllib.request.urlopen(urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"}), timeout=15).read())
+        except urllib.error.HTTPError as e:
+            if e.code in (400, 404):          # the venue answered: no such symbol
+                raise NotListed()
+            raise                             # 403/451/5xx: venue unreachable from here = unknown
+    for name, fmt, ok in (("binance", "https://fapi.binance.com/fapi/v1/exchangeInfo?symbol={s}USDT",
+                           lambda d, s: any(x.get("symbol") == s + "USDT" and x.get("status") == "TRADING" for x in d.get("symbols", []))),
+                          ("bybit", "https://api.bybit.com/v5/market/instruments-info?category=linear&symbol={s}USDT",
+                           lambda d, s: any(x.get("symbol") == s + "USDT" and x.get("status") == "Trading" for x in (d.get("result") or {}).get("list", [])))):
+        hit, err_ = False, False
+        for pre in ("", "1000", "10000", "1M"):
+            try:
+                if ok(get(fmt.format(s=pre + sym)), pre + sym): hit = True; break
+            except NotListed:
+                continue
+            except Exception:
+                err_ = True; break
+        if hit: found.append(name)
+        elif err_: unknown.append(name)
+    try:
+        d = get(f"https://www.okx.com/api/v5/public/instruments?instType=SWAP&instFamily={sym}-USDT")
+        if any(x.get("instFamily") == sym + "-USDT" and x.get("state") == "live" for x in d.get("data", [])): found.append("okx")
+    except NotListed:
+        pass
+    except Exception:
+        unknown.append("okx")
     try:
         if _HL is None:
             req = urllib.request.Request("https://api.hyperliquid.xyz/info", data=b'{"type":"meta"}', headers={"Content-Type": "application/json"})
-            _HL = {u["name"].upper() for u in json.loads(urllib.request.urlopen(req, timeout=15).read())["universe"] if not u.get("isDelisted")}
-        if sym in _HL or "K" + sym in _HL: out.append("hyperliquid")
+            _HL = {u["name"] for u in json.loads(urllib.request.urlopen(req, timeout=15).read())["universe"] if not u.get("isDelisted")}
+        if sym in _HL or "k" + sym in _HL: found.append("hyperliquid")
     except Exception:
-        pass
-    return out
+        unknown.append("hyperliquid")
+    return found, unknown
 
-def alert_block_reason(a, leads, recent):
-    """None if the alert may go out, else a short reason (the alert is then logged as a near-miss instead)."""
-    asset = str(a.get("asset") or "").strip().upper()
-    lead = next((l for l in leads if str(l.get("asset", "")).strip().upper() == asset), {})
-    ct = str(lead.get("catalyst_type") or "").lower()
-    fam = str(lead.get("family") or "").lower()
-    if fam in ("unlock_short_7d", "insider_long", "funding_fade", "macro"):
-        return f"{fam} family has negative backtest expectancy"
-    if ct in NEG_FAMILIES:
-        return f"{ct} family has negative backtest expectancy"
-    if asset in recent:
-        return f"already alerted within {COOLDOWN_DAYS} days"
-    plan = a.get("plan") if isinstance(a.get("plan"), dict) else {}
-    if lead.get("kind") == "crypto" and str(plan.get("direction") or lead.get("direction")) == "short":
-        v = perp_venues(asset)
-        if not v:
-            return "no perp venue found on Binance/Bybit/OKX/Hyperliquid to short it"
-        a["_venues"] = v
-    return None
-
+def alert_block_reason(a, leads, recent, sent_now):
+    """None if the alert may go out, else a short reason. Guard errors never block (the alert goes out as before)."""
+    try:
+        asset = str(a.get("asset") or "").strip().upper()
+        lead = next((l for l in leads if str(l.get("asset", "")).strip().upper() == asset), {})
+        plan = a.get("plan") if isinstance(a.get("plan"), dict) else {}
+        d = _dir(plan.get("direction") or lead.get("direction"))
+        fam = str(lead.get("family") or "").strip().lower()
+        ct = str(lead.get("catalyst_type") or "").strip().lower()
+        if fam in NEG_FAMILY_TAGS or (ct, d) in NEG_PAIRS:
+            return "family", f"{fam or ct} {d} lost money in the backtest"
+        if asset in recent or asset in sent_now:
+            return "cooldown", f"already alerted within {COOLDOWN_DAYS} days"
+        if str(lead.get("kind") or "").lower() == "crypto" and d == "short":
+            found, unknown = perp_venues(asset)
+            if not found and not unknown:
+                return "venue", "no perp venue on Binance, Bybit, OKX or Hyperliquid to short it"
+        return None
+    except Exception as e:
+        return None
 
 # ---------------------------------------------------------------- APPLY
 def apply(d):
@@ -436,24 +456,33 @@ def apply(d):
         run = o.get("run") if isinstance(o.get("run"), dict) else {}
         run_errors = [str(e) for e in (run.get("errors") or [])]
         leads = [l for l in (o.get("leads") or []) if isinstance(l, dict) and l.get("asset")]
+        if not isinstance(run.get("near_misses"), list):
+            run["near_misses"] = []
+        recent = None
+        rc, out = sh(["ledger.py", "alerted-recent"], timeout=60)       # before `add`, so this slot's own leads are not in it
+        try:
+            recent = {str(x.get("asset", "")).strip().upper() for x in json.loads(out.strip().splitlines()[-1])}
+        except Exception:
+            run_errors.append("cooldown check unavailable (alerted-recent unreadable)")
+            recent = set()
         if leads:
             json.dump(leads, open("leads.json", "w"), ensure_ascii=False)
             rc, out = sh(["ledger.py", "add", "leads.json"], timeout=300)
             if rc != 0:
                 run_errors.append("ledger add failed")
         sent = []
-        rc, out = sh(["ledger.py", "alerted-recent"], timeout=60)
-        try:
-            recent = {str(x.get("asset", "")).strip().upper() for x in json.loads(out.strip().splitlines()[-1])}
-        except Exception:
-            recent = set()
         for i, a in enumerate((o.get("alerts") or [])[:2]):
             if not isinstance(a, dict) or not a.get("asset") or not a.get("text"):
                 continue
             asset = str(a["asset"]).strip()
-            why = alert_block_reason(a, leads, recent)
-            if why:
-                run.setdefault("near_misses", []).append({"asset": asset, "score": 8, "why": "alert blocked: " + why})
+            blk = alert_block_reason(a, leads, recent, {x.upper() for x in sent})
+            if blk:
+                kind_, why = blk
+                if kind_ == "family":
+                    run_errors.append(f"alert {asset} blocked: {why}")
+                else:
+                    lead = next((l for l in leads if str(l.get("asset", "")).strip().upper() == asset.upper()), {})
+                    run["near_misses"].append({"asset": asset, "score": lead.get("score") or 8, "why": "alert blocked: " + why})
                 print("alert blocked by guard")
                 continue
             open(f"alert_{i}.txt", "w").write(str(a["text"]))
