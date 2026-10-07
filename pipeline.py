@@ -74,8 +74,8 @@ def _x(req, tries=4):
             time.sleep(5 * 2 ** i)
 
 
-def list_files(d, contains, extra=""):
-    q = f"'{FOLDER}' in parents and name contains '{contains}' and trashed = false {extra}"
+def list_files(d, contains, extra="", parent=None):
+    q = f"'{parent or FOLDER}' in parents and name contains '{contains}' and trashed = false {extra}"
     out, tok = [], None
     while True:
         r = _x(d.files().list(q=q, orderBy="createdTime", pageSize=100, pageToken=tok,
@@ -643,12 +643,38 @@ def apply(d):
         rename(d, f, tag + " " + f["name"])
 
 
+ARCHIVE_NAME = "X-scout archive"                       # subfolder of the X-scout folder
+ARCHIVE_AFTER_DAYS, PURGE_AFTER_DAYS = 7, 60
+
+
+def archive_folder(d, create=True):
+    """Id of the "X-scout archive" subfolder (created when missing and `create`), else None."""
+    q = (f"'{FOLDER}' in parents and name = '{ARCHIVE_NAME}' and mimeType = 'application/vnd.google-apps.folder' "
+         f"and trashed = false")
+    fs = _x(d.files().list(q=q, pageSize=10, fields="files(id,name)")).get("files", [])
+    if fs or not create:
+        return fs[0]["id"] if fs else None
+    body = {"name": ARCHIVE_NAME, "mimeType": "application/vnd.google-apps.folder", "parents": [FOLDER]}
+    return _x(d.files().create(body=body, fields="id"))["id"]
+
+
 def tidy(d):
-    """Trash pipeline files older than 7 days (the human-readable run logs are kept)."""
-    cutoff = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S")
-    for key in ("XS-IN", "XS-OUT", "XS-POSTS"):
-        for f in list_files(d, key, f"and createdTime < '{cutoff}'"):
-            d.files().update(fileId=f["id"], body={"trashed": True}).execute()
+    """XS-IN / XS-OUT files (any prefix: DONE, BAD, NOPUSH, DUPLICATE) older than 7 days move to the "X-scout archive"
+    subfolder - they are the evidence for audits - and are trashed only after 60 days. Raw XS-POSTS files are trashed
+    after 7 days as before (the XS-IN doc holds what the run read). The human-readable run logs are kept."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cut = (now - datetime.timedelta(days=ARCHIVE_AFTER_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
+    purge = (now - datetime.timedelta(days=PURGE_AFTER_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
+    old = [f for key in ("XS-IN", "XS-OUT") for f in list_files(d, key, f"and createdTime < '{cut}'")]
+    arch = archive_folder(d, create=bool(old))            # no archive folder -> exception -> nothing is moved or trashed
+    for f in old:
+        _x(d.files().update(fileId=f["id"], addParents=arch, removeParents=FOLDER, fields="id"))
+    for f in list_files(d, "XS-POSTS", f"and createdTime < '{cut}'"):
+        _x(d.files().update(fileId=f["id"], body={"trashed": True}))
+    if arch:
+        for key in ("XS-IN", "XS-OUT"):
+            for f in list_files(d, key, f"and createdTime < '{purge}'", parent=arch):
+                _x(d.files().update(fileId=f["id"], body={"trashed": True}))
 
 
 def main():
