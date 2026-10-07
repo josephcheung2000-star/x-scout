@@ -25,6 +25,7 @@ PART_CHARS = 4000                                      # UTF-8 bytes per XS-IN p
 HEALTH = "health.json"                                 # committed by the workflow: once-per-day notice memory
 ERRORS = []
 SLOT_RX = re.compile(r"\d{4}-\d{2}-\d{2} \d{4}")
+FLAG_FORCE_CAP = 5                                     # exchange-flag triggers that may force a full run, per prep
 TRIG_TTL_DAYS = 7                                      # a second-tier trigger key re-fires only after this many days
 S2_PER_KEY = 10                                        # second-tier items shown per source in the input doc
 S2_KEYS = ["coinbase_new", "upbit_krw_new", "bithumb_krw_new", "bithumb_notices", "bithumb_wallet", "upbit_notices",
@@ -268,9 +269,21 @@ def prep(d, slot):
         st["trig_seen"] = seen
         st["trig_slot"] = tslot
         json.dump(st, open("state.json", "w"), ensure_ascii=False, indent=1)
+    # Korean exchange-flag triggers: only warning_on / delisting / non-routine wallet_suspend may force a full run, and at
+    # most FLAG_FORCE_CAP of them per prep; the others are listed in the input without forcing (they are noisy: Upbit
+    # cautions flip both ways, Bithumb wallets pause for routine network upgrades)
+    nforce, forcing = 0, False
+    for t in new_trig:
+        if t.get("type") == "exchange_flag":
+            if t.get("force") and nforce < FLAG_FORCE_CAP:
+                nforce += 1; forcing = True
+            elif t.get("force"):
+                t["force"], t["capped"] = False, True
+        else:
+            forcing = True
     if new_trig:
         tri["triggers"] = list(tri.get("triggers") or []) + new_trig
-        if tri.get("mode") != "full":
+        if forcing and tri.get("mode") != "full":
             tri["mode"], tri["read_all_posts"] = "full", True
     if isinstance(prev, dict) and prev.get("mode") == "full" and tri.get("mode") != "full":
         tri["mode"], tri["read_all_posts"] = "full", True     # a forced rebuild never downgrades the first build

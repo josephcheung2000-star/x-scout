@@ -44,7 +44,9 @@ TRIGGERS (key is stable per event)
   polymarket_new        new market (<= 48h), liquidity >= $100k, not sports / daily strike   polymarket_new:<slug>
   polymarket_mispricing overround flag, not sports, and (event not neg-risk-augmented, or best-ask sum < 1 or
                         best-bid sum > 1)                                         polymarket_mispricing:<event slug>
-  exchange_flag         Korean exchange flag/notice for an asset: Upbit caution / warning ON or OFF, Bithumb investment
+  exchange_flag         (force=true only for warning_on, delisting and non-routine wallet_suspend; the pipeline lets at
+                        most 5 forcing flag triggers per prep force a full run, the rest are listed only)
+                        Korean exchange flag/notice for an asset: Upbit caution / warning ON or OFF, Bithumb investment
                         warning designated / lifted, Bithumb/Upbit deposit-withdrawal suspended / resumed, delisting
                         notice                                   krw_flag:<upbit|bithumb>:<event>:<ASSET>
                         (event: warning_on|warning_off|caution_on|caution_off|wallet_suspend|wallet_resume|delisting;
@@ -201,10 +203,18 @@ def krw_diff(ex, rows, flags):
         NEW_SEEN[f"{ex}_{fk}"] = set(ms)                   # current set, so a re-flag fires again
     return out, trig
 
-def flag_trigger(ex, event, asset, what, url):
-    """One key per exchange + event + asset: the flag diff and the exchange notice of the same event share it."""
+FORCING_EVENTS = {"warning_on", "delisting", "wallet_suspend"}    # the only flag events that may force a full run
+# routine / pre-announced wallet work (network upgrade, maintenance, swap, a dated time window): listed, never forcing
+ROUTINE_RX = re.compile(r"정기\s*점검|점검|업그레이드|하드\s*포크|네트워크|메인넷|마이그레이션|스왑|예정|"
+                        r"\d{1,2}\s*/\s*\d{1,2}\s*\(?.{0,4}\)?\s*(오전|오후)?\s*\d{1,2}\s*시|"
+                        r"(?i:maintenance|upgrade|hard ?fork|network|migration|scheduled|token swap)")
+
+def flag_trigger(ex, event, asset, what, url, routine=False):
+    """One key per exchange + event + asset: the flag diff and the exchange notice of the same event share it.
+    force = may this trigger force a full run: warning_on, delisting, and wallet_suspend unless it is routine."""
+    force = event in FORCING_EVENTS and not (event == "wallet_suspend" and routine)
     return {"type": "exchange_flag", "key": f"krw_flag:{ex}:{event}:{asset.upper()}", "asset": asset.upper(),
-            "event": event, "what": what, "url": url}
+            "event": event, "force": force, **({"routine": True} if routine else {}), "what": what, "url": url}
 
 def upbit_krw_new():
     try:
@@ -259,8 +269,9 @@ def _notice_items(ex, rows):
     for n in rows:
         evs = notice_events(n["title"])
         out.append({**n, "events": [f"{e}:{a}" for e, a in evs]} if evs else n)
+        routine = bool(ROUTINE_RX.search(str(n.get("title") or "")))
         for e, a in evs:
-            trig.append(flag_trigger(ex, e, a, f"{ex.capitalize()} notice: {n['title']}", n.get("url")))
+            trig.append(flag_trigger(ex, e, a, f"{ex.capitalize()} notice: {n['title']}", n.get("url"), routine=routine))
     return out, trig
 
 def bithumb_notices():
@@ -797,6 +808,8 @@ def main():
         res["triggers"] += trig
     uniq = {}
     for t in res["triggers"]:
+        if t["key"] in uniq and "force" in t:               # a routine notice for the same event wins: not forcing
+            uniq[t["key"]]["force"] = bool(uniq[t["key"]].get("force")) and bool(t.get("force"))
         uniq.setdefault(t["key"], t)
     res["triggers"] = list(uniq.values())
     res["secs"] = round(time.time() - T0, 1)
