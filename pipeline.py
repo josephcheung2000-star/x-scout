@@ -469,7 +469,7 @@ def apply(d):
             recent = set()
         if leads:
             json.dump(leads, open("leads.json", "w"), ensure_ascii=False)
-            rc, out = sh(["ledger.py", "add", "leads.json"], timeout=300)
+            rc, out = sh(["ledger.py", "add", "leads.json", "--slot", slot], timeout=300)
             if rc != 0:
                 run_errors.append("ledger add failed")
         sent = []

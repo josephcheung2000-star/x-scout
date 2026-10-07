@@ -150,6 +150,9 @@ def crypto_prices(ids):
                 time.sleep(8)
     return out
 
+_QUOTE_TS = {}            # ticker -> unix time of the quoted regular-session price (Yahoo meta.regularMarketTime)
+STALE_QUOTE_MIN = 45     # older than this = the market is closed: the quote is the last close, not a tradeable price
+
 def stock_prices(tickers):
     out = {}
     for t in sorted(set(x for x in tickers if x)):
@@ -160,7 +163,9 @@ def stock_prices(tickers):
             try:
                 d = http(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}, timeout=20)
                 if "chart" in d:
-                    out[t] = d["chart"]["result"][0]["meta"]["regularMarketPrice"]
+                    meta = d["chart"]["result"][0]["meta"]
+                    out[t] = meta["regularMarketPrice"]
+                    if meta.get("regularMarketTime"): _QUOTE_TS[t] = float(meta["regularMarketTime"])
                 else:
                     out[t] = float(d["data"]["primaryData"]["lastSalePrice"].replace("$", "").replace(",", ""))
                 break
@@ -271,6 +276,13 @@ def _tdir(l):
 def _sign(l):
     return -1 if _tdir(l) == "short" else 1
 
+def _stale_quote(l, t):
+    """True when a stock/futures lead's price is a previous close (market shut). Entering at that close would credit the
+    lead with the overnight/weekend gap it could not have traded (e.g. earnings after the close)."""
+    if l.get("kind") not in ("stock", "commodity"): return False
+    ts = _QUOTE_TS.get(l.get("ticker"))
+    return bool(ts) and (t.timestamp() - ts) > STALE_QUOTE_MIN * 60
+
 def _ev(l):
     p, t, st = _num(l.get("p_win")), _num(l.get("target_pct")), _num(l.get("stop_pct"))
     if _tdir(l) is None: return None
@@ -283,9 +295,13 @@ LEAD_KEYS = ("asset", "kind", "cg_id", "ticker", "market_slug", "outcome", "scor
              "direction", "thesis", "handles", "urls", "p_win", "target_pct", "stop_pct", "horizon_days", "liq_usd",
              "instrument", "funding_ann_pct", "ev_pct", "regime", "family", "lean")
 
-def add(path):
+def add(path, slot=None):
     s = load(); new = json.load(open(path)); cp, sp = price_map(new)
     t = now(); added = merged = 0
+    try:   # how late the ledger entry is vs the Claude slot that judged it (the model saw prices ~at the slot)
+        lag = round((t - datetime.strptime(slot, "%Y-%m-%d %H%M").replace(tzinfo=timezone(timedelta(hours=9)))).total_seconds() / 60)
+    except Exception:
+        lag = None
     for l in new:
         key = (l.get("asset") or "").upper()
         p, b = px(l, cp, sp)
@@ -306,6 +322,10 @@ def add(path):
             "first_seen": t.isoformat(timespec="minutes"), "entry": p, "bench_entry": b,
             "bench": BENCH.get(l.get("kind")),
             "status": "open" if p else "untracked", "cp": {}, "mfe": 0.0, "mae": 0.0, "last": p, "last_at": None})
+        if slot: s["leads"][-1].update(slot=slot, entry_lag_min=lag)
+        if p and _stale_quote(l, t):           # market closed: enter at the first live session price instead
+            s["leads"][-1].update(entry=None, bench_entry=None, last=None, status="untracked", await_session=True, prior_close=p)
+            p = None
         if p: _pm_levels(s["leads"][-1]); s["leads"][-1]["ev_net_pct"] = _ev(s["leads"][-1])
         added += 1
     save(s); print(f"ADD: {added} new, {merged} merged into existing open leads")
@@ -313,13 +333,13 @@ def add(path):
 def update():
     s = load()
     retry = [l for l in s["leads"] if l["status"] == "untracked" and l.get("kind") in PRICED_KINDS
-             and (now() - datetime.fromisoformat(l["first_seen"])).total_seconds() < 86400]
+             and (now() - datetime.fromisoformat(l["first_seen"])).total_seconds() < (4 if l.get("await_session") else 1) * 86400]
     if retry:
         cp, sp = price_map(retry)
         for l in retry:
             p, b = px(l, cp, sp)
-            if p:
-                l.update(entry=p, bench_entry=b, status="open", entry_late=True, last=p)
+            if p and not _stale_quote(l, now()):
+                l.update(entry=p, bench_entry=b, status="open", entry_late=True, last=p, entry_at=now().isoformat(timespec="minutes"))
                 _pm_levels(l); l["ev_net_pct"] = _ev(l)
     open_ = [l for l in s["leads"] if l["status"] == "open"]
     if not open_:
@@ -334,7 +354,7 @@ def update():
         r = sign * (p / l["entry"] - 1)
         l["mfe"] = round(max(l.get("mfe", 0), r), 4); l["mae"] = round(min(l.get("mae", 0), r), 4)
         l["last"], l["last_at"] = p, t.isoformat(timespec="minutes")
-        age_d = (t - datetime.fromisoformat(l["first_seen"])).total_seconds() / 86400
+        age_d = (t - datetime.fromisoformat(l.get("entry_at") or l["first_seen"])).total_seconds() / 86400   # from the actual entry
         _ev_track(l, r, age_d, t)
         for name, days in CHECKPOINTS:
             if name not in l["cp"] and age_d >= days:
@@ -1093,7 +1113,7 @@ if __name__ == "__main__":
     if cmd == "pull": pull(init="--init" in sys.argv); sys.exit(0)
     f = {"push": push, "update": update, "stats": stats, "playbook": playbook, "brief": brief}
     if cmd in f: f[cmd]()
-    elif cmd == "add": add(sys.argv[2])
+    elif cmd == "add": add(sys.argv[2], sys.argv[4] if len(sys.argv) > 4 and sys.argv[3] == "--slot" else None)
     elif cmd == "set-playbook": set_playbook(sys.argv[2])
     elif cmd == "runlog":
         try: runlog(sys.argv[2])
