@@ -23,7 +23,7 @@ PLAN.json: {"direction": "long"|"short", "entry_lo": p, "entry_hi": p, "stop": p
   ledger.py notify pull|fetch|other [reason]   send one short fixed-template failure notice to Joseph
   ledger.py add leads.json       add shortlisted leads (list of dicts, see LEAD FIELDS) with entry prices
   ledger.py update               refresh prices of open leads; fill 1d/3d/7d/14d/30d checkpoints; close at 30d
-  ledger.py stats                performance by score bucket / alerted / catalyst type / component / handle
+  ledger.py stats                "Stats sample: ..." line, then JSON: performance by score / alerted / type / component / handle
   ledger.py playbook             print current playbook
   ledger.py set-playbook f.md    replace playbook (old version kept in playbook_history)
   ledger.py brief                compact summary for the run log (open leads, new checkpoints, track record)
@@ -482,6 +482,7 @@ def stats():
                     "costs_book_pct": round(sum(l["paper"].get("costs_pct", 0) * l["plan"].get("size_pct", 0) for l in cl if l.get("plan")), 3),
                     "win_rate": round(sum(1 for l in cl if l["paper"].get("pnl_pct", 0) > 0) / len(cl), 2) if cl else None,
                     "by_exit": {k: sum(1 for l in cl if l["paper"].get("exit_reason") == k) for k in ("stop", "targets", "horizon")}}
+    print(_sample_line(L0, out["sample"]))              # header line first; the JSON follows (parse from the first "{")
     print(json.dumps(out, ensure_ascii=False, indent=1))
 
 def playbook():
@@ -498,6 +499,12 @@ def _past_horizon(l, t):
     try: return (t - datetime.fromisoformat(l["first_seen"])).total_seconds() / 86400 >= (_num(l.get("horizon_days")) or 14)
     except Exception: return False
 
+def _sample_line(R, info):
+    """The one-line header that marks stats built on the post-restart, de-duplicated sample (brief AND stats)."""
+    return (f"Stats sample: {info['rows_used']} independent leads since {info['since'][:10]} "
+            f"({info['dropped_pre_since']} pre-restart and {info['dropped_overlap']} overlapping repeats excluded); "
+            f"with a 7d result: {sum(1 for l in R if ((l.get('cp') or {}).get('7d') or {}).get('excess') is not None)}")
+
 def brief():
     s = load(); L = s["leads"]; t = now()
     o = [l for l in L if l["status"] == "open" and not _past_horizon(l, t)]
@@ -505,9 +512,7 @@ def brief():
     R, info = _stat_rows(L)
     lines = [f"Ledger: {len(L)} leads total, {len(o)} live (within their horizon), {ph} past horizon (still priced to 30d), "
              f"playbook {'set' if s.get('playbook') else 'empty'}",
-             f"Stats sample: {info['rows_used']} independent leads since {info['since'][:10]} "
-             f"({info['dropped_pre_since']} pre-restart and {info['dropped_overlap']} overlapping repeats excluded); "
-             f"with a 7d result: {sum(1 for l in R if ((l.get('cp') or {}).get('7d') or {}).get('excess') is not None)}"]
+             _sample_line(R, info)]
     for l in sorted(o, key=lambda l: l["first_seen"], reverse=True)[:12]:
         r = (l["last"] / l["entry"] - 1) * _sign(l) if l.get("entry") and l.get("last") else None
         lines.append(f"- {l['asset']} s{l.get('score')}{' ALERTED' if l.get('alerted') else ''} since {l['first_seen'][:16]} "
