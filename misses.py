@@ -9,6 +9,11 @@ checks which ones a lead had flagged in the 7 days before the move window ended,
   state["miss_stats"] rolling 14-day recall per kind + precision proxy of score>=7 leads
 stdout: a short human summary (private input doc) + one line "MISSES_JSON {...}" with counts only (public log).
 Never crashes, never exits non-zero, stays under ~2 minutes. Python 3.12 stdlib only.
+Movers are ranked by a volatility-scaled move ("z": % move / typical stdev of that kind and window; commodities use
+their own 20-day realised stdev; Polymarket moves are probability POINTS / 5 pts), never by mixing % with points.
+Sports and novelty Polymarket markets are not tradeable misses (triage.SPORT_RX + NOVELTY_RX + gamma sport fields).
+Single-underlying, unleveraged ETFs (IBIT, GLD, USO ...) count as leads on their underlying; multi-member (sector /
+index) ETFs are NOT mapped to their members (not trivial: weights, partial exposure) and never match a mover.
 """
 import json, os, re, sys, time, traceback, threading, urllib.request, urllib.parse, urllib.error
 from concurrent.futures import ThreadPoolExecutor
@@ -27,6 +32,31 @@ COMMOD = {  # Yahoo symbol -> names a lead might use
     "NG=F": ("NATGAS", "NATURALGAS", "NG", "GAS"), "ZC=F": ("CORN",), "ZW=F": ("WHEAT",), "ZS=F": ("SOYBEANS", "SOYBEAN", "SOY"),
     "KC=F": ("COFFEE",), "CC=F": ("COCOA",), "SB=F": ("SUGAR",), "LE=F": ("CATTLE", "LIVECATTLE")}
 NOTES = []                        # source notes for the summary (fallbacks, failures)
+try:                              # one sports filter for triage and the miss log
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from triage import SPORT_RX
+except Exception:
+    SPORT_RX = re.compile(r"(?i)(\bvs\.?\s|\bpremier league\b|\bchampions league\b|\bnba\b|\bnfl\b|\bmlb\b|\bnhl\b|\bufc\b|"
+                          r"\bworld cup\b|\bgrand slam\b|\bsuper bowl\b|\bstanley cup\b|\bworld series\b|\btennis\b|\bgolf\b|"
+                          r"\bf1\b|\bformula 1\b|\bepl\b|\bla liga\b|\bserie a\b|\bbundesliga\b|\bmvp\b|\bplayoffs?\b)")
+POLITICS_RX = re.compile(r"(?i)\b(election|president|nominee|senate|governor|mayor|primary)\b")   # as in triage: not sports
+NOVELTY_RX = re.compile(r"(?i)(# of tweets|\btweets?\b|\bpost \d+|\bsay \"|\bmention\b|\boscars?\b|\bgrammys?\b|\bemmys?\b|"
+                        r"box office|rotten tomatoes|\bspotify\b|\bbillboard\b|\byoutube\b|\bmrbeast\b|\btiktok\b|"
+                        r"\bnetflix top\b|\bhighest temperature\b|\btemperature in\b|\bweather\b|\bhurricane\b|\bsnow\b|"
+                        r"\bgta vi\b|\bjesus\b|\balien\b|\bufo\b|\bpope\b|\bbaby\b|\bdating\b|\bmarr(y|ied|iage)\b|"
+                        r"\bdivorce\b|\bpregnan|\btime person of the year\b|\bnobel\b|\beurovision\b|\bchess\b|\besports?\b|"
+                        r"\bleague of legends\b|\bcs2\b|\bdota\b|\bvalorant\b)")
+# Typical stdev of a move (% , or Polymarket probability points) per kind and window, for ranking only
+SIGMA = {("crypto", "24h"): 5.0, ("crypto", "7d"): 13.0, ("stock", "session"): 2.5, ("commodity", "1d"): 1.8,
+         ("commodity", "5d"): 4.0, ("polymarket", "24h"): 5.0}
+ETF_UNDERLYING = {   # single-underlying, unleveraged, long-only ETFs -> (mover kind, symbol in that mover's _syms)
+    **{t: ("crypto", "BTC") for t in ("IBIT", "FBTC", "GBTC", "BTC", "BITB", "ARKB", "HODL", "BRRR", "EZBC", "BTCO", "BTCW", "BITO")},
+    **{t: ("crypto", "ETH") for t in ("ETHA", "FETH", "ETHE", "ETHW", "CETH", "QETH", "EZET", "ETHV")},
+    **{t: ("crypto", "SOL") for t in ("SOLZ", "BSOL", "GSOL")},
+    **{t: ("commodity", "GOLD") for t in ("GLD", "IAU", "GLDM", "SGOL", "AAAU", "BAR")},
+    **{t: ("commodity", "SILVER") for t in ("SLV", "SIVR")}, "USO": ("commodity", "WTI"), "BNO": ("commodity", "BRENT"),
+    "UNG": ("commodity", "NATGAS"), "CPER": ("commodity", "COPPER"), "PPLT": ("commodity", "PLATINUM"),
+    "CORN": ("commodity", "CORN"), "WEAT": ("commodity", "WHEAT"), "SOYB": ("commodity", "SOYBEANS")}
 _lock = threading.Lock()
 
 def note(s):
@@ -39,8 +69,13 @@ def get(url, ua=UA, timeout=20, headers=None):
     t = min(timeout, left())
     if t < 2: raise TimeoutError("time budget spent")
     h = {"User-Agent": ua, "Accept": "application/json"}; h.update(headers or {})
-    with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=t) as r:
-        return json.loads(r.read())
+    for attempt in (0, 1):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=t) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:      # 403 is often a transient bot wall / rate limit: retry once
+            if e.code != 403 or attempt or left() < 6: raise
+            time.sleep(2); t = min(timeout, left())
 
 def num(v):
     try:
@@ -150,7 +185,10 @@ def _commod_one(sym):
     end = datetime.fromtimestamp(int((res.get("meta") or {}).get("regularMarketTime") or bars[-1][0]), UTC)
     c1 = (bars[-1][1] / bars[-2][1] - 1) * 100; c5 = (bars[-1][1] / bars[-6][1] - 1) * 100
     names = {sym, sym.split("=")[0], *COMMOD.get(sym, ())}
-    base = {"kind": "commodity", "asset": COMMOD.get(sym, (sym,))[0], "id": sym, "_end": end, "_syms": names}
+    rets = [(bars[i][1] / bars[i - 1][1] - 1) * 100 for i in range(max(1, len(bars) - 21), len(bars) - 1)]
+    sd = (sum((r - sum(rets) / len(rets)) ** 2 for r in rets) / (len(rets) - 1)) ** 0.5 if len(rets) >= 5 else None
+    base = {"kind": "commodity", "asset": COMMOD.get(sym, (sym,))[0], "id": sym, "_end": end, "_syms": names,
+            **({"_sd1": sd} if sd else {})}
     if abs(c1) >= 3: return [{**base, "chg_pct": round(c1, 1), "window": "1d"}]
     if abs(c5) >= 7: return [{**base, "chg_pct": round(c5, 1), "window": "5d"}]
     return []
@@ -167,8 +205,9 @@ def commodities(now):
     return out
 
 def polymarket(now):
-    """Gamma pages hold at most 100 rows, so ask for the liquid markets sorted by 1-day change, both ends."""
-    out, seen = [], set()
+    """Gamma pages hold at most 100 rows, so ask for the liquid markets sorted by 1-day change, both ends.
+    Sports and novelty markets are dropped (not tradeable misses for this scout)."""
+    out, seen, skipped = [], set(), 0
     for asc in ("false", "true"):
         off = 0
         while off < 500:
@@ -180,12 +219,33 @@ def polymarket(now):
                 slug = m.get("slug") or str(m.get("id"))
                 if ch is None or abs(ch) < 0.15 or (liq or 0) < 1e5 or slug in seen: continue
                 seen.add(slug)
+                if not_tradeable(m):
+                    skipped += 1; continue
                 ev = [e.get("slug") for e in (m.get("events") or []) if isinstance(e, dict) and e.get("slug")]
                 out.append({"kind": "polymarket", "asset": (m.get("question") or slug)[:80], "id": slug, "chg_pct": round(ch * 100, 1),
                             "window": "24h", "_end": now, "_syms": {slug.upper(), *(x.upper() for x in ev)}})
             if len(d) < 100 or abs(num(d[-1].get("oneDayPriceChange")) or 0) < 0.15: break
             off += 100
+    if skipped: note(f"polymarket: {skipped} sports/novelty movers excluded")
     return out
+
+def not_tradeable(m):
+    """Sports (gamma sport fields, or SPORT_RX unless it is an election market) or novelty Polymarket market."""
+    evs = [e for e in (m.get("events") or []) if isinstance(e, dict)]
+    text = " ".join([str(m.get("question") or ""), str(m.get("slug") or "")] + [str(e.get("title") or "") for e in evs])
+    if m.get("sportsMarketType") or m.get("gameId") or any(e.get("gameId") or e.get("sport") for e in evs): return True
+    if SPORT_RX.search(text) and not POLITICS_RX.search(text): return True
+    return bool(NOVELTY_RX.search(text))
+
+def zscore(m):
+    """Volatility-scaled move used to rank movers across kinds (% for prices, points for Polymarket)."""
+    w = str(m.get("window") or "")
+    w = "session" if w.startswith("session") else w
+    sd = m.get("_sd1")
+    if sd and m["kind"] == "commodity":
+        sd = sd * (5 ** 0.5 if w == "5d" else 1)
+    sd = sd or SIGMA.get((m["kind"], w)) or 5.0
+    return round(m["chg_pct"] / sd, 2)
 
 # ---------------- matching ----------------
 def lead_keys(l):
@@ -206,7 +266,16 @@ def events(l):
 def lead_id(l):
     return str(l.get("id") or f"{norm(l.get('asset'))}-{l.get('first_seen')}")
 
+def etf_underlying(l):
+    for k in ("ticker", "asset"):
+        u = ETF_UNDERLYING.get(norm(l.get(k)))
+        if u: return u
+    return None
+
 def matches(l, mv):
+    u = etf_underlying(l) if (l.get("kind") or "").lower() in ("stock", "other", "etf", "") else None
+    if u and u[0] == mv["kind"]:                       # single-underlying ETF lead -> its underlying's mover
+        return u[1] in {s.upper() for s in mv["_syms"]}
     lk = (l.get("kind") or "other").lower()
     if lk not in (mv["kind"], "other", ""): return False
     if mv["kind"] == "crypto":
@@ -337,7 +406,8 @@ def main():
         for k in KINDS:   # a re-run whose source failed keeps what the earlier run of the same date got for that kind
             if src.get(k) == "fail" and old and k in (old.get("sources_ok") or []):
                 keep += [m for m in old.get("movers") or [] if m.get("kind") == k]
-        movers.sort(key=lambda m: -abs(m["chg_pct"]))
+        for m in movers: m["z"] = zscore(m)
+        movers.sort(key=lambda m: -abs(m["z"]))          # rank by volatility-scaled size, not % mixed with points
         n, c, c7 = counts(movers)
         for m in keep:
             k = m["kind"]; n[k] = old["n"].get(k, 0); c[k] = old["caught"].get(k, 0); c7[k] = (old.get("caught_s7") or {}).get(k, 0)
@@ -346,7 +416,7 @@ def main():
         stored = []
         for k in KINDS:
             km = [m for m in movers if m["kind"] == k][:CAP_PER_KIND] + [m for m in keep if m["kind"] == k]
-            stored += [{x: m.get(x) for x in ("kind", "asset", "id", "chg_pct", "window", "caught", "seen", "best_score", "alerted",
+            stored += [{x: m.get(x) for x in ("kind", "asset", "id", "chg_pct", "z", "window", "caught", "seen", "best_score", "alerted",
                                                "dir_ok", "lead_hours_before", "lead_hits")} for m in km]
         rec = {"date": today, "at": iso(now), "sources_ok": ok, "movers": stored,
                "recall": {k: (ratio(c[k], n[k]) if (k == "all" or k in ok) else None) for k in (*KINDS, "all")},
@@ -374,8 +444,8 @@ def main():
                          + f" | precision proxy {pp if pp is not None else 'n/a'} (n={ms.get('precision_n')})")
         miss = [m for m in movers if not m["caught"]][:5]
         if miss:
-            lines.append("  top missed: " + ", ".join(f"{m['asset'][:28]} {m['chg_pct']:+.0f}%" + ("pt" if m["kind"] == "polymarket" else "")
-                                                      + f" ({m['kind'][:5]},{m['window'].replace('session ', '')})" for m in miss))
+            lines.append("  top missed: " + ", ".join(f"{m['asset'][:28]} {m['chg_pct']:+.0f}" + (" pts" if m["kind"] == "polymarket" else "%")
+                                                      + f" ({m['kind'][:5]},{m['window'].replace('session ', '')}" + (f",z{m['z']:+.1f})" if m.get("z") is not None else ")") for m in miss))
         caught = [m for m in movers if m["caught"]][:3]
         if caught:
             lines.append("  caught: " + ", ".join(f"{m['asset'][:20]} {m['chg_pct']:+.0f}% s{m['best_score']:g}"
