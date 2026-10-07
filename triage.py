@@ -17,7 +17,8 @@ TRIGGERS
   x_cluster   the same coin/ticker named by >= 3 different X accounts (>= 4 if > 150 posts; >= 6 for majors; BTC/ETH
               excluded); re-fires when the cluster doubles
   x_blast     a single post with >= 200k views naming a coin/ticker
-A trigger with the same key fires at most once per 12h."""
+A trigger with the same key fires at most once per 12h - except within the same slot (env XS_SLOT): a rebuild of a
+slot's input sees the triggers its first build saw, so it is never downgraded to light."""
 import json, os, re, urllib.request
 from datetime import datetime, timezone, timedelta
 
@@ -175,10 +176,16 @@ def main():
             if (NOW - ts).total_seconds() < 12 * 3600: recent[k] = ts.isoformat(timespec="minutes")
         except Exception:
             pass
+    rslot = state.get("recent_trigger_slot") if isinstance(state.get("recent_trigger_slot"), dict) else {}
+    rslot = {k: v for k, v in rslot.items() if k in recent}
+    cur_slot = os.environ.get("XS_SLOT") or None
     fresh, repeat = [], 0
     for t in trig:
-        if t["key"] in recent: repeat += 1; continue
-        recent[t["key"]] = NOW.isoformat(timespec="minutes"); fresh.append(t)
+        if t["key"] in recent and not (cur_slot and rslot.get(t["key"]) == cur_slot): repeat += 1; continue
+        if t["key"] not in recent:
+            recent[t["key"]] = NOW.isoformat(timespec="minutes")
+            if cur_slot: rslot[t["key"]] = cur_slot
+        fresh.append(t)
     trig = fresh
     # per-account activity for the monthly follow/unfollow review: monthly buckets, each post counted once,
     # retweeted/quoted inner posts excluded, X's own follow flag kept when the timeline provides it
@@ -215,6 +222,7 @@ def main():
     if state_ok:   # never rewrite a missing/corrupt state file (it would wipe the ledger)
         state["seen_edgar"] = (lst(state.get("seen_edgar")) + new_ids)[-3000:]
         state["recent_triggers"] = recent
+        state["recent_trigger_slot"] = rslot
         state["handle_seen"] = hs
         state["handle_seen_ids"] = (lst(state.get("handle_seen_ids")) + new_counted)[-8000:]
         state["edgar_queue"] = queue[120:] if mode == "full" else queue[-240:]   # oldest 120 reviewed now, rest next full run

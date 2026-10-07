@@ -141,8 +141,12 @@ def one_line(t, n):
 
 
 # ---------------------------------------------------------------- PREP
+TRIG_BOOK = ("trig_seen", "trig_slot", "recent_triggers", "recent_trigger_slot")   # trigger bookkeeping in state.json
+
+
 def prep(d, slot):
     name = "XS-IN " + slot_name(slot)
+    forced = bool(os.environ.get("XS_FORCE_PREP"))
     rc, out = sh(["ledger.py", "pull"], timeout=120)
     if rc != 0:
         time.sleep(30)
@@ -152,6 +156,15 @@ def prep(d, slot):
         if health_once("pull_alert"):
             notify("pull")
         return False
+    # ONE BUILD PER SLOT. The ledger (strongly consistent, unlike Drive's name search) records every slot whose XS-IN
+    # was written. A second build for a slot found its triggers already used, went LIGHT, and - being the newest file -
+    # replaced the full build in the Claude run (audit 2026-09-28..10-07: 29 of 67 slots built 2-3 times).
+    st0 = load_json("state.json", {}) or {}
+    prev = (st0.get("prepped_slots") or {}).get(slot_name(slot)) if isinstance(st0.get("prepped_slots"), dict) else None
+    if prev and not forced:
+        print(f"prep: {name} already built ({prev.get('mode') if isinstance(prev, dict) else '?'}) - skipped")
+        return True
+    book0 = {k: st0.get(k) for k in TRIG_BOOK}
     for cmd in (["poll-replies"], ["update"]):
         rc, out = sh(["ledger.py"] + cmd, timeout=600)
         if rc != 0:
@@ -170,7 +183,8 @@ def prep(d, slot):
             os.remove(f)
     x = {"ok": False, "errors": ["no X posts from the Mac feeder in the last 3.5 h (Mac asleep or offline?)"]}
     cutoff = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=3.5)).strftime("%Y-%m-%dT%H:%M:%S")
-    files = [f for f in list_files(d, "XS-POSTS", f"and createdTime > '{cutoff}'") if f["name"].startswith("XS-POSTS")]
+    files = [f for f in list_files(d, "XS-POSTS", f"and createdTime > '{cutoff}'")
+             if f["name"].startswith("XS-POSTS") or (prev and f["name"].startswith("USED XS-POSTS"))]   # a rebuild re-reads them
     posts_all, seen_ids = [], set()
     for f in reversed(files):                                  # newest first
         try:
@@ -225,7 +239,8 @@ def prep(d, slot):
     for k, v in (s2.get("counts") or {}).items():
         counts[k] = v
     src_errs += [f"s2 {one_line(e, 90)}" for e in (s2.get("errors") or [])][:8]
-    rc, out = sh(["triage.py"], timeout=300, env_extra={"XS_SLOT_HOUR": str(slot.hour)})   # sweep = the 08:45 slot, not the wall clock
+    rc, out = sh(["triage.py"], timeout=300, env_extra={"XS_SLOT_HOUR": str(slot.hour),      # sweep = the 08:45 slot, not the wall clock
+                                                        "XS_SLOT": slot_name(slot)})          # a key fired for THIS slot stays fresh
     tri = load_json("triage.json", {"mode": "full", "triggers": [], "focus_ids": [], "read_all_posts": True})
     # second-tier triggers: each event key counts once per TRIG_TTL_DAYS; any new one makes this a full run
     st = load_json("state.json", None)
@@ -235,16 +250,23 @@ def prep(d, slot):
         cut = (now_utc - datetime.timedelta(days=TRIG_TTL_DAYS)).isoformat(timespec="minutes")
         seen = st.get("trig_seen") if isinstance(st.get("trig_seen"), dict) else {}
         seen = {k: v for k, v in seen.items() if str(v) >= cut}
+        tslot = st.get("trig_slot") if isinstance(st.get("trig_slot"), dict) else {}
+        tslot = {k: v for k, v in tslot.items() if k in seen}
         for t in s2.get("triggers") or []:
-            if isinstance(t, dict) and t.get("key") and t["key"] not in seen:
+            # a key first seen for THIS slot is still new to it (a rebuild must not lose the triggers of the first build)
+            if isinstance(t, dict) and t.get("key") and (t["key"] not in seen or tslot.get(t["key"]) == slot_name(slot)):
                 new_trig.append(t)
-                seen[t["key"]] = now_utc.isoformat(timespec="minutes")
+                if t["key"] not in seen:
+                    seen[t["key"]] = now_utc.isoformat(timespec="minutes"); tslot[t["key"]] = slot_name(slot)
         st["trig_seen"] = seen
+        st["trig_slot"] = tslot
         json.dump(st, open("state.json", "w"), ensure_ascii=False, indent=1)
     if new_trig:
         tri["triggers"] = list(tri.get("triggers") or []) + new_trig
         if tri.get("mode") != "full":
             tri["mode"], tri["read_all_posts"] = "full", True
+    if isinstance(prev, dict) and prev.get("mode") == "full" and tri.get("mode") != "full":
+        tri["mode"], tri["read_all_posts"] = "full", True     # a forced rebuild never downgrades the first build
     print(f"sources: {len(counts)} feeds, errors={len(src_errs)} | triage mode={tri.get('mode')} triggers={len(tri.get('triggers', []))} (new second-tier {len(new_trig)})")
 
     sweep = slot.hour == 8
@@ -325,12 +347,34 @@ def prep(d, slot):
     L += ["", "END OF INPUT"]
     text = "\n".join(L)
     parts = split_parts(L)
+    if not forced and list_files(d, name):
+        # another build of this slot landed while this one ran (or before the ledger knew of it): keep the first.
+        # Undo this build's trigger bookkeeping so triggers it alone saw stay new for the next slot; keep the rest
+        # (prices, replies) and push it.
+        s = load_json("state.json", None)
+        if isinstance(s, dict):
+            for k, v in book0.items():
+                if v is None: s.pop(k, None)
+                else: s[k] = v
+            json.dump(s, open("state.json", "w"), ensure_ascii=False, indent=1)
+        print(f"prep: {name} appeared during this build - not written again")
+        parts = []
     for i, part in enumerate(parts):
         title = name if len(parts) == 1 else f"{name} part {i + 1} of {len(parts)}"
         create_doc(d, title, part + f"--- END OF PART {i + 1} OF {len(parts)} ---\n")
-    print(f"input doc: {name}, {len(chosen)} posts, {len(text)} chars, {len(parts)} part(s)")
-    for f in files:                                            # consumed only once the input doc exists
-        rename(d, f, "USED " + f["name"])
+    if parts:
+        print(f"input doc: {name}, {len(chosen)} posts, {len(text)} chars, {len(parts)} part(s)")
+        for f in files:                                        # consumed only once the input doc exists
+            if not f["name"].startswith("USED "):
+                rename(d, f, "USED " + f["name"])
+        s = load_json("state.json", None)
+        if isinstance(s, dict):
+            ps = s.get("prepped_slots") if isinstance(s.get("prepped_slots"), dict) else {}
+            ps[slot_name(slot)] = {"mode": tri.get("mode"), "posts": len(chosen), "parts": len(parts),
+                                   "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="minutes"),
+                                   "builds": int((prev or {}).get("builds", 1) if isinstance(prev, dict) else 0) + 1}
+            s["prepped_slots"] = dict(sorted(ps.items())[-24:])
+            json.dump(s, open("state.json", "w"), ensure_ascii=False, indent=1)
 
     rc, out = sh(["ledger.py", "push"], timeout=120)
     if rc != 0:
