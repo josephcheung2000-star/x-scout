@@ -854,10 +854,13 @@ def handles(save_it=False):
         rep["id"] = f"{out['month']}:{hash(json.dumps(rep, sort_keys=True)) & 0xffff}"
         s["handles_report"] = rep; save(s)
 
+HANDLE_MIN_N = 8
+
 def handle_scores(K=5):
     """Per-account 7d track record, shrunk toward the all-lead average with K pseudo-results, and a weight for scoring."""
     s = load(); rows = []
     for l in _stat_rows(s.get("leads", []))[0]:
+        if not _tdir(l): continue                                      # a no-lean watch has no side to credit
         ex = ((l.get("cp") or {}).get("7d") or {}).get("excess") if isinstance(l.get("cp"), dict) else None
         if isinstance(ex, (int, float)): rows.append((l, ex))
     if not rows: print("Handle track records: no 7-day results yet - every account has weight 0"); return
@@ -865,18 +868,19 @@ def handle_scores(K=5):
     base_hit = sum(ex > 0 for _, ex in rows) / len(rows); base_mean = statistics.mean(ex for _, ex in rows)
     per = {}
     for l, ex in rows:
+        # credit only the accounts behind the lead when it was logged: a re-mention came after the entry price, so
+        # crediting it would reward accounts for posting about a move that had already happened
         hs = _norm_handles(l.get("handles"))
-        for m in _list(l.get("mentions")):
-            if isinstance(m, dict): hs |= _norm_handles(m.get("handles"))
-        for h in hs: per.setdefault(h, {}).setdefault(str(l.get("asset")).upper(), ex)
+        for h in hs: per.setdefault(h, {}).setdefault(_ikey(l), ex)
     out = []
     for h, d in per.items():
         xs = list(d.values()); n = len(xs); k = sum(x > 0 for x in xs)
         hs_, es = (k + K * base_hit) / (n + K), (sum(xs) + K * base_mean) / (n + K)
-        w = (1 if hs_ >= base_hit + 0.1 else -1 if hs_ <= base_hit - 0.1 else 0) if n >= 4 else 0
+        lo, hi = _wilson(k, n)                                         # one-sided 95%: a weight needs evidence, not luck
+        w = (1 if lo > base_hit else -1 if hi < base_hit else 0) if n >= HANDLE_MIN_N else 0
         out.append((n, h, k, hs_, statistics.mean(xs), es, w))
     lines = [f"Handle track records (7d excess, one result per asset; all leads: n={len(rows)}, hit {base_hit:.0%}, mean {base_mean:+.1%}; "
-             f"shrunk with {K} average pseudo-results; weight needs n>=4; unlisted accounts = weight 0)"]
+             f"shrunk with {K} average pseudo-results; weight needs n>={HANDLE_MIN_N} and a Wilson bound clear of the base rate; unlisted accounts = weight 0)"]
     for n, h, k, hs_, m, es, w in sorted(out, key=lambda r: (-abs(r[6]), -r[0]))[:20]:
         lines.append(f"@{h} n={n} hit {k}/{n} (shrunk {hs_:.0%}) mean {m:+.1%} (shrunk {es:+.1%}) weight {w:+d}")
     print("\n".join(lines))
