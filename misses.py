@@ -234,9 +234,12 @@ def match_all(movers, leads):
             first = pdt(l.get("first_seen")) or min(e[0] for e in ev)
             sc = max([e[1] for e in ev if e[1] is not None] or [num(l.get("max_score")) or num(l.get("score")) or 0])
             hits.append({"lid": lead_id(l), "score": sc, "alerted": any(e[2] for e in ev) or bool(l.get("alerted")),
-                         "dir_ok": dir_ok(l.get("direction"), -mv["chg_pct"] if (l.get("kind") == "polymarket" and str(l.get("outcome") or "yes").strip().lower() != "yes") else mv["chg_pct"]), "hours": (end - min(first, *[e[0] for e in ev])).total_seconds() / 3600})
-        best = max(hits, key=lambda h: (h["score"], h["hours"])) if hits else None
-        mv.update({"caught": bool(hits), "best_score": best and best["score"], "alerted": bool(hits) and any(h["alerted"] for h in hits),
+                         "dir_ok": dir_ok(l.get("lean") if str(l.get("direction") or "").lower() == "watch" else l.get("direction"), -mv["chg_pct"] if (l.get("kind") == "polymarket" and str(l.get("outcome") or "yes").strip().lower() != "yes") else mv["chg_pct"]), "hours": (end - min(first, *[e[0] for e in ev])).total_seconds() / 3600})
+        # "caught" = flagged beforehand ON THE RIGHT SIDE. A short on a coin that then pumped, or a no-lean watch,
+        # did not catch the move; those are kept as "seen" (the scout looked at it) for context.
+        right = [h for h in hits if h["dir_ok"] is True]
+        best = max(right or hits, key=lambda h: (h["score"], h["hours"])) if hits else None
+        mv.update({"caught": bool(right), "seen": bool(hits), "best_score": best and best["score"], "alerted": bool(right) and any(h["alerted"] for h in right),
                    "dir_ok": best and best["dir_ok"], "lead_hours_before": best and round(best["hours"], 1),
                    "lead_hits": [[h["lid"], h["dir_ok"]] for h in hits][:5]})
     return movers
@@ -297,7 +300,7 @@ def build_stats(s, now):
     for r in recent:
         for m in r.get("movers") or []:
             for lid, ok in (m.get("lead_hits") or []) if isinstance(m, dict) else []:
-                hit[lid] = hit.get(lid) or ok is not False
+                hit[lid] = hit.get(lid) or ok is True          # a no-lean watch (None) is not a correct call
     lo = now - timedelta(days=ROLL_DAYS)
     hi = [l for l in s.get("leads", []) if isinstance(l, dict) and (pdt(l.get("first_seen")) or lo) > lo
           and max(num(l.get("max_score")) or 0, num(l.get("score")) or 0) >= 7]
@@ -343,7 +346,7 @@ def main():
         stored = []
         for k in KINDS:
             km = [m for m in movers if m["kind"] == k][:CAP_PER_KIND] + [m for m in keep if m["kind"] == k]
-            stored += [{x: m.get(x) for x in ("kind", "asset", "id", "chg_pct", "window", "caught", "best_score", "alerted",
+            stored += [{x: m.get(x) for x in ("kind", "asset", "id", "chg_pct", "window", "caught", "seen", "best_score", "alerted",
                                                "dir_ok", "lead_hours_before", "lead_hits")} for m in km]
         rec = {"date": today, "at": iso(now), "sources_ok": ok, "movers": stored,
                "recall": {k: (ratio(c[k], n[k]) if (k == "all" or k in ok) else None) for k in (*KINDS, "all")},
