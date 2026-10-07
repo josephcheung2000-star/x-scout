@@ -41,3 +41,54 @@ This repo is public: scripts only, no credentials, no data. The Actions logs pri
 - Tested and rejected: fixed 20/10/14 exits, a $20M volume bar, family-based p_win/EV, regime filter, pump filters,
   entry delay, trailing stop (no out-of-sample support). No family has a proven out-of-sample edge.
 - Shadow test restarted: 2026-09-28T02:00Z .. 2026-11-28.
+
+## Changelog
+
+### 2026-10-07 - audit fixes (runs of 2026-09-28 .. 10-07)
+Ledger and stats
+- 01 Polymarket targets and stops are capped at what a share can reach (0.99 / 0.01), so a market that resolves the
+  right way counts as a target hit instead of timing out.
+- 02 A "watch" lead is scored on the side its `lean` names; a watch with no lean is price-tracked but kept out of
+  directional stats and calibration.
+- 03 The learning stats (stats, brief, shadow scorecard) use only leads logged since the 2026-09-28 restart, one per
+  instrument per 7 days; returns are capped at +-100% inside group means (so one Polymarket market cannot dominate); the brief says how many leads are still
+  within their horizon.
+- 04 A re-mention merges into an earlier lead only if it is the same instrument (CoinGecko id / ticker / Polymarket
+  market + outcome) on the same side. An alert on a lead first logged more than 6 hours earlier gets its own row priced
+  at alert time, so the move before the alert is not credited to it.
+- 05 A stock or futures lead logged while its market is shut enters at the first live-session price, not the last
+  close; holding periods run from the actual entry.
+- 08 An account gets a +1/-1 weight only with at least 8 results and a Wilson bound clear of the base rate; only the
+  accounts behind a lead when it was first logged are credited.
+- 15 Leads may carry `lean` as "up" / "down" / "none" (or long / short), and Polymarket leads may carry share-price
+  levels `target_price` and `stop_price` next to `target_pct` / `stop_pct`. When valid, the share prices win and the %
+  levels are recomputed from the actual entry; impossible prices are ignored and noted. Unknown fields are still ignored (the
+  current main ledger already accepts all of these without error, so the prompt can ship first).
+
+Pipeline
+- 06 XS-IN parts are at most 4,000 bytes (the Claude run's Drive reader cut ~6-7 KB parts); Drive calls retry on rate
+  limits and server errors; the 08:45 daily sweep follows the slot being prepared, not the wall clock; the source window
+  covers the time since the last prep plus 30 minutes (3.5-12 h); an explicit `prep` dispatch no longer bypasses the "already prepared" check.
+- 09 One build per slot. The ledger now records each slot whose input was written (`prepped_slots`); a second prep for
+  that slot does nothing. Just before writing, prep checks Drive again and, if the slot's XS-IN appeared meanwhile,
+  writes nothing and gives back the triggers it would have used. A forced rebuild (`XS_FORCE_PREP`) keeps the first
+  build's full mode, re-reads the posts the first build consumed, and still sees that slot's own triggers.
+- 10 Korean exchange events are triggers (once per 7 days per asset and event): Upbit caution / warning flag on and
+  off, Bithumb investment-warning designation and lifting, Bithumb deposit/withdrawal suspension and resumption (new
+  public status feed), and the same events in Bithumb (and, when reachable, Upbit) notice titles.
+- 11 Second-tier lists no longer hide what matters: every exchange flag / notice / wallet change, every unlock of 2% or
+  more of unlocked supply and every insider buy of $1M+ (or cluster) is shown; other sources still show 10 and name the
+  ones left out. The input doc may run to more 4 KB parts.
+- 12 Old XS-IN / XS-OUT files are moved to the Drive subfolder "X-scout archive" after 7 days and trashed only after
+  60 days (they were trashed after 7, which destroyed audit evidence). Raw XS-POSTS files are still trashed after 7 days.
+- 13 Polymarket alert backstop: an alert is blocked (logged as a near-miss) when the side bought moved 8 points or
+  more against the trade in the past 24 hours, or when its target or stop as a share price is outside 0.01-0.99. If the
+  price data cannot be fetched, the alert is not blocked. (The rule against mid-priced bets anchored on an outside
+  forecast stays in the prompt: it cannot be checked by code.)
+
+Miss log
+- 07 A mover counts as caught only if a lead flagged it beforehand on the right side; wrong-side leads and no-lean
+  watches are kept as "seen".
+- 14 Sports and novelty Polymarket markets are not counted as misses; movers are ranked by size relative to their
+  usual volatility instead of mixing % moves with Polymarket points; a 403 from a source is retried once; a lead on a
+  single-asset ETF (e.g. IBIT, GLD, USO) counts for its underlying (multi-stock ETFs are not mapped to their members).
