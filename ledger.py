@@ -241,6 +241,23 @@ def _cost_rt(l, plan=None, days=0.0, entry=None):
         carry = 0.01 * days / 365
     return round(2 * (fee + slip) + carry, 5)
 
+PM_TOP, PM_BOTTOM = 0.99, 0.01      # a share at >=0.99 / <=0.01 is treated as resolved
+
+def _pm_levels(l):
+    """Polymarket target/stop are % moves of a share bounded in [0, 1]. Clamp them to what the share can reach
+    (resolution at ~1 or ~0) so a won/lost market resolves the race instead of timing out as a miss."""
+    e = _num(l.get("entry"))
+    if l.get("kind") != "polymarket" or not (0 < e < 1): return
+    tmax, smax = 100 * (PM_TOP / e - 1), 100 * (1 - PM_BOTTOM / e)
+    t, s = _num(l.get("target_pct")), _num(l.get("stop_pct"))
+    if t > 0 and t > tmax:
+        l["target_pct_model"] = t; l["levels_clamped"] = True
+        if tmax > 0: l["target_pct"] = round(tmax, 2)
+        else: l.pop("target_pct", None); l["levels_invalid"] = "share already >= 0.99: no upside to target"
+    if s > 0 and s > smax:
+        l["stop_pct_model"] = s; l["levels_clamped"] = True
+        l["stop_pct"] = round(smax, 2)
+
 def _ev(l):
     p, t, st = _num(l.get("p_win")), _num(l.get("target_pct")), _num(l.get("stop_pct"))
     if not (0 < p < 1 and t > 0 and st > 0): return None
@@ -272,7 +289,7 @@ def add(path):
             "first_seen": t.isoformat(timespec="minutes"), "entry": p, "bench_entry": b,
             "bench": BENCH.get(l.get("kind")),
             "status": "open" if p else "untracked", "cp": {}, "mfe": 0.0, "mae": 0.0, "last": p, "last_at": None})
-        if p: s["leads"][-1]["ev_net_pct"] = _ev(s["leads"][-1])
+        if p: _pm_levels(s["leads"][-1]); s["leads"][-1]["ev_net_pct"] = _ev(s["leads"][-1])
         added += 1
     save(s); print(f"ADD: {added} new, {merged} merged into existing open leads")
 
@@ -286,7 +303,7 @@ def update():
             p, b = px(l, cp, sp)
             if p:
                 l.update(entry=p, bench_entry=b, status="open", entry_late=True, last=p)
-                l["ev_net_pct"] = _ev(l)
+                _pm_levels(l); l["ev_net_pct"] = _ev(l)
     open_ = [l for l in s["leads"] if l["status"] == "open"]
     if not open_:
         try: paper_update(s)
