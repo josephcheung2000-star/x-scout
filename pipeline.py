@@ -30,6 +30,13 @@ S2_PER_KEY = 10                                        # second-tier items shown
 S2_KEYS = ["coinbase_new", "upbit_krw_new", "bithumb_krw_new", "bithumb_notices", "bithumb_wallet", "upbit_notices",
            "unlocks_14d", "governance", "etf_flows", "insider_buys", "stock_movers", "commodities", "polymarket_extra"]
 S2_DROP = {"src", "id", "at", "url", "title", "rule", "recipients", "description"}
+# Trigger-relevant second-tier items are never hidden behind "(+N more not shown)": every exchange flag / notice /
+# wallet change, every unlock of >= 2% of unlocked supply, every >= $1M or cluster insider buy. A hard cap keeps a
+# runaway feed from flooding the doc (each 420-byte line costs ~1/10 of a 4 KB part; more parts are fine).
+S2_ALL_KEYS = {"upbit_krw_new", "bithumb_krw_new", "bithumb_notices", "bithumb_wallet", "upbit_notices", "commodities"}
+S2_PRIORITY = {"unlocks_14d": lambda it: (it.get("pct_supply") or 0) >= 2,
+               "insider_buys": lambda it: (it.get("value") or 0) >= 1e6 or (it.get("insiders") or 1) >= 3}
+S2_HARD_CAP = 60
 
 
 def jst_now():
@@ -328,15 +335,7 @@ def prep(d, slot):
                 if isinstance(it, dict) and "error" not in it:
                     L.append(f"{k}: " + json.dumps(it, ensure_ascii=False))
         L += ["", "=== SECOND-TIER SOURCES (Korea/Coinbase listings, unlocks, governance, ETF flows, insider buys, US stock movers, commodities, Polymarket) ==="]
-        for k in S2_KEYS:
-            items = [it for it in (s2.get(k) or []) if isinstance(it, dict) and "error" not in it]
-            cap = len(items) if k == "commodities" else S2_PER_KEY
-            for it in items[:cap]:
-                rest = {a: b for a, b in it.items() if a not in S2_DROP and b not in (None, "", [], {})}
-                rest = dict(sorted(rest.items(), key=lambda kv: isinstance(kv[1], (list, dict))))   # scalars first: the line is clipped
-                L.append(one_line(f"{k}: {it.get('title')} | {it.get('url')} | {json.dumps(rest, ensure_ascii=False, default=str)}", 420))
-            if len(items) > cap:
-                L.append(f"{k}: (+{len(items) - cap} more not shown)")
+        L += s2_lines(s2)
         L += ["", f"=== X POSTS TO READ ({len(chosen)} of {len(posts)} relevant posts; id | @handle (followers) | created UTC | likes/rts/replies/views | tab | text | url) ==="]
         for p in chosen:
             m = p.get("m") or {}
@@ -384,6 +383,36 @@ def prep(d, slot):
         err("ledger push after prep failed")
         return False
     return True
+
+
+def s2_lines(s2):
+    """Input-doc lines for the second-tier sources: trigger-relevant items in full (S2_ALL_KEYS / S2_PRIORITY, up to
+    S2_HARD_CAP), the rest up to S2_PER_KEY per source, and a named list of whatever is left out."""
+    L = []
+    for k in S2_KEYS:
+        items = [it for it in (s2.get(k) or []) if isinstance(it, dict) and "error" not in it]
+        if k in S2_ALL_KEYS:
+            shown = items[:S2_HARD_CAP]
+        else:
+            pri = S2_PRIORITY.get(k)
+            top = [it for it in items if pri and _safe(pri, it)][:S2_HARD_CAP]
+            shown = top + [it for it in items if not any(it is x for x in top)][:S2_PER_KEY]
+        for it in shown:
+            rest = {a: b for a, b in it.items() if a not in S2_DROP and b not in (None, "", [], {})}
+            rest = dict(sorted(rest.items(), key=lambda kv: isinstance(kv[1], (list, dict))))   # scalars first: the line is clipped
+            L.append(one_line(f"{k}: {it.get('title')} | {it.get('url')} | {json.dumps(rest, ensure_ascii=False, default=str)}", 420))
+        hidden = [it for it in items if not any(it is x for x in shown)]
+        if hidden:
+            names = ", ".join(one_line(it.get("name") or it.get("ticker") or it.get("asset") or it.get("title"), 40) for it in hidden)
+            L.append(one_line(f"{k}: (+{len(hidden)} more not shown: {names})", 420))
+    return L
+
+
+def _safe(f, x):
+    try:
+        return bool(f(x))
+    except Exception:
+        return False
 
 
 def split_parts(lines, limit=None):
