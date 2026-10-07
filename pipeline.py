@@ -11,7 +11,7 @@ Every 10 minutes the workflow runs `python3 pipeline.py tick`, which does two th
         -> digest if due -> ledger push -> rename the file "DONE XS-OUT ..."
 Env (repo secrets): X_AUTH_TOKEN, X_CT0, TG_TOKEN, TG_STORE_CHAT, TG_ALERT_CHAT, GWS_DRIVE (authorized_user JSON).
 The repo is public, so this script prints only counts and status words - never post text, leads or tokens."""
-import json, os, re, subprocess, sys, time, datetime, urllib.request, urllib.error
+import json, os, re, subprocess, sys, time, datetime, urllib.request, urllib.error, urllib.parse
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaInMemoryUpload
@@ -508,6 +508,71 @@ def perp_venues(sym):
         unknown.append("hyperliquid")
     return found, unknown
 
+# Polymarket backstop for the prompt rules (audit 2026-10-07): entries after a >= 8-pt 24h fall of the side bought went
+# 0/11; a target or stop the share price cannot reach (outside [0.01, 0.99]) never resolves the race. Only these
+# machine-checkable parts are enforced; "mid-priced bet anchored on an outside forecast" stays a prompt rule.
+PM_FALL_PTS = 0.08
+PM_LO, PM_HI = 0.01, 0.99
+PM_UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/133 Safari/537.36"}
+
+
+def _getj(url):
+    return json.loads(urllib.request.urlopen(urllib.request.Request(url, headers=PM_UA), timeout=15).read())
+
+
+def pm_snapshot(slug, outcome):
+    """(current share price, share price ~24h ago) of a Polymarket outcome: gamma outcomePrices + clob prices-history
+    (the same endpoints ledger.py prices and simulates with). Raises when unavailable."""
+    d = _getj("https://gamma-api.polymarket.com/markets?slug=" + urllib.parse.quote(str(slug)))
+    m = d[0] if isinstance(d, list) and d else None
+    if not m: raise ValueError("market not found")
+    oc = [str(x).strip().lower() for x in json.loads(m.get("outcomes") or "[]")]
+    i = oc.index(str(outcome or "Yes").strip().lower())
+    now_p = float(json.loads(m.get("outcomePrices") or "[]")[i])
+    tok = json.loads(m.get("clobTokenIds") or "[]")[i]
+    t1 = int(time.time()); t0 = t1 - 26 * 3600
+    h = _getj(f"https://clob.polymarket.com/prices-history?market={tok}&startTs={t0}&endTs={t1}&fidelity=60").get("history") or []
+    pts = sorted((float(x["t"]), float(x["p"])) for x in h if isinstance(x, dict) and "t" in x and "p" in x)
+    before = [p for t, p in pts if t <= t1 - 24 * 3600]
+    p24 = before[-1] if before else (pts[0][1] if pts and pts[0][0] <= t1 - 20 * 3600 else None)
+    return now_p, p24
+
+
+def _f(x):
+    try:
+        v = float(x); return v if v == v else None
+    except Exception:
+        return None
+
+
+def pm_block(lead, plan, d):
+    """Reason string if a Polymarket alert must be blocked, else None. Any data problem -> None (never blocks)."""
+    try:
+        now_p, p24 = pm_snapshot(lead.get("market_slug"), lead.get("outcome"))
+    except Exception:
+        now_p, p24 = None, None
+    sign = -1 if d == "short" else 1
+    if now_p is not None and p24 is not None and sign * (now_p - p24) <= -PM_FALL_PTS:
+        return f"Polymarket share moved {abs(now_p - p24) * 100:.0f} pts against the trade in 24h ({p24:.2f} -> {now_p:.2f})"
+    e = now_p
+    if e is None and plan:
+        lo, hi = _f(plan.get("entry_lo")), _f(plan.get("entry_hi"))
+        e = (lo + hi) / 2 if lo and hi else None
+    lv = {"target": _f(lead.get("target_price")), "stop": _f(lead.get("stop_price"))}
+    if plan:
+        tps = [_f(t.get("price")) for t in plan.get("tps") or [] if isinstance(t, dict)]
+        if lv["target"] is None and tps and None not in tps: lv["target"] = max(tps) if sign > 0 else min(tps)
+        if lv["stop"] is None: lv["stop"] = _f(plan.get("stop"))
+    if e and 0 < e < 1:
+        t, st = _f(lead.get("target_pct")), _f(lead.get("stop_pct"))
+        if lv["target"] is None and t: lv["target"] = e * (1 + sign * t / 100)
+        if lv["stop"] is None and st: lv["stop"] = e * (1 - sign * st / 100)
+    bad = [f"{k} {v:.3f}" for k, v in lv.items() if v is not None and not (PM_LO <= v <= PM_HI)]
+    if bad:
+        return f"Polymarket {' and '.join(bad)} outside the reachable share range [{PM_LO}, {PM_HI}]"
+    return None
+
+
 def alert_block_reason(a, leads, recent, sent_now):
     """None if the alert may go out, else a short reason. Guard errors never block (the alert goes out as before)."""
     try:
@@ -521,6 +586,10 @@ def alert_block_reason(a, leads, recent, sent_now):
             return "family", f"{fam or ct} {d} lost money in the backtest"
         if asset in recent or asset in sent_now:
             return "cooldown", f"already alerted within {COOLDOWN_DAYS} days"
+        if str(lead.get("kind") or "").lower() == "polymarket":
+            why = pm_block(lead, plan, d)
+            if why:
+                return "polymarket", why
         if str(lead.get("kind") or "").lower() == "crypto" and d == "short":
             found, unknown = perp_venues(asset)
             if not found and not unknown:
