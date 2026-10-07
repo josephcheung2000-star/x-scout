@@ -346,7 +346,7 @@ def prep(d, slot):
     L += ["", "END OF INPUT"]
     text = "\n".join(L)
     parts = split_parts(L)
-    if not forced and list_files(d, name):
+    if not forced and slot_built(list_files(d, name), name):
         # another build of this slot landed while this one ran (or before the ledger knew of it): keep the first.
         # Undo this build's trigger bookkeeping so triggers it alone saw stay new for the next slot; keep the rest
         # (prices, replies) and push it.
@@ -358,9 +358,8 @@ def prep(d, slot):
             json.dump(s, open("state.json", "w"), ensure_ascii=False, indent=1)
         print(f"prep: {name} appeared during this build - not written again")
         parts = []
-    for i, part in enumerate(parts):
-        title = name if len(parts) == 1 else f"{name} part {i + 1} of {len(parts)}"
-        create_doc(d, title, part + f"--- END OF PART {i + 1} OF {len(parts)} ---\n")
+    if parts:
+        write_parts(d, name, parts)
     if parts:
         print(f"input doc: {name}, {len(chosen)} posts, {len(text)} chars, {len(parts)} part(s)")
         for f in files:                                        # consumed only once the input doc exists
@@ -413,6 +412,42 @@ def _safe(f, x):
         return bool(f(x))
     except Exception:
         return False
+
+
+def slot_built(files, name):
+    """True when `files` hold a COMPLETE input for `name`: the single doc, or parts 1..n of some "part k of n" set.
+    An incomplete set (a prep that failed mid-way) is not a build, so a later tick rebuilds the slot."""
+    names = {f.get("name") for f in files}
+    if name in names:
+        return True
+    sets = {}
+    for nm in names:
+        m = re.fullmatch(re.escape(name) + r" part (\d+) of (\d+)", str(nm))
+        if m:
+            sets.setdefault(int(m.group(2)), set()).add(int(m.group(1)))
+    return any(got >= set(range(1, n + 1)) for n, got in sets.items())
+
+
+BUILD_PREFIX = "XS-BUILDING "                          # parts are uploaded under this name (it does not contain "XS-IN")
+
+
+def write_parts(d, name, parts):
+    """Upload every part under a temporary name, then rename them all to the final "XS-IN ..." names, so a failure
+    mid-upload never leaves a partial XS-IN set. Earlier (incomplete, or force-replaced) parts of the slot and leftover
+    temporary parts are moved out of the way first (renamed SUPERSEDED, trashed for temporaries)."""
+    tmp_name = BUILD_PREFIX + name[len("XS-IN "):]
+    for f in list_files(d, tmp_name):
+        _x(d.files().update(fileId=f["id"], body={"trashed": True}))
+    for f in list_files(d, name):
+        if f["name"].startswith(name):
+            rename(d, f, "SUPERSEDED " + f["name"])
+    made = []
+    for i, part in enumerate(parts):
+        suffix = "" if len(parts) == 1 else f" part {i + 1} of {len(parts)}"
+        fid = create_doc(d, tmp_name + suffix, part + f"--- END OF PART {i + 1} OF {len(parts)} ---\n")
+        made.append(({"id": fid, "name": tmp_name + suffix}, name + suffix))
+    for f, final in made:
+        rename(d, f, final)
 
 
 def split_parts(lines, limit=None):
@@ -738,8 +773,9 @@ def tidy(d):
     arch = archive_folder(d, create=bool(old))            # no archive folder -> exception -> nothing is moved or trashed
     for f in old:
         _x(d.files().update(fileId=f["id"], addParents=arch, removeParents=FOLDER, fields="id"))
-    for f in list_files(d, "XS-POSTS", f"and createdTime < '{cut}'"):
-        _x(d.files().update(fileId=f["id"], body={"trashed": True}))
+    for key in ("XS-POSTS", BUILD_PREFIX.strip()):        # raw posts, and temporary parts of failed uploads
+        for f in list_files(d, key, f"and createdTime < '{cut}'"):
+            _x(d.files().update(fileId=f["id"], body={"trashed": True}))
     if arch:
         for key in ("XS-IN", "XS-OUT"):
             for f in list_files(d, key, f"and createdTime < '{purge}'", parent=arch):
@@ -760,7 +796,7 @@ def main():
     mins = (slot - now).total_seconds() / 60
     want_prep = mode == "prep" or (mode in ("tick", "need-prep") and PREP_WINDOW[0] <= mins <= PREP_WINDOW[1])
     if want_prep and not os.environ.get("XS_FORCE_PREP"):
-        if list_files(d, "XS-IN " + slot_name(slot)):
+        if slot_built(list_files(d, "XS-IN " + slot_name(slot)), "XS-IN " + slot_name(slot)):
             want_prep = False                              # already prepared for this slot (a second set of parts
                                                            # for one slot lets the Claude run mix parts of two builds)
     if mode == "need-prep":                                # workflow asks first, so Chromium is installed only when needed

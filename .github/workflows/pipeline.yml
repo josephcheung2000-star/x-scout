@@ -10,6 +10,10 @@ on:
       job:
         description: "tick | prep | apply"
         default: "tick"
+      force_prep:
+        description: "rebuild the next slot's XS-IN even if one exists (true/false)"
+        type: boolean
+        default: false
 permissions:
   contents: write
 concurrency:
@@ -27,6 +31,7 @@ jobs:
       TG_ALERT_CHAT: ${{ secrets.TG_ALERT_CHAT }}
       GWS_DRIVE: ${{ secrets.GWS_DRIVE }}
       JOB: ${{ github.event.inputs.job || 'tick' }}
+      XS_FORCE_PREP: ${{ github.event.inputs.force_prep == 'true' && '1' || '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
