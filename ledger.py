@@ -332,17 +332,20 @@ def add(path, slot=None):
                   and (t - datetime.fromisoformat(x["first_seen"])).total_seconds() < 72 * 3600]
         if recent:
             x = recent[0]
+            # `alerted` is set ONLY by send_alert (an alert that was actually delivered): the model's own flag is kept
+            # as model_alerted, so an alert the pipeline guard blocked starts no cooldown and enters no alert stats
             x.setdefault("mentions", []).append({"at": t.isoformat(timespec="minutes"), "score": l.get("score"), "px": p,
-                                                  "alerted": bool(l.get("alerted")), "handles": l.get("handles", [])})
+                                                  "model_alerted": bool(l.get("alerted")), "handles": l.get("handles", [])})
             x["max_score"] = max(_num(x.get("max_score") or x.get("score")), _num(l.get("score")))
-            x["alerted"] = x["alerted"] or bool(l.get("alerted")); merged += 1; continue
+            merged += 1; continue
         s["leads"].append({**{k: l.get(k) for k in LEAD_KEYS if l.get(k) is not None},
             "score": _num(l.get("score")),
-            "id": f"{key}-{t.strftime('%Y%m%d%H%M')}", "alerted": bool(l.get("alerted")), "max_score": _num(l.get("score")),
+            "id": f"{key}-{t.strftime('%Y%m%d%H%M')}", "alerted": False, "max_score": _num(l.get("score")),
             "first_seen": t.isoformat(timespec="minutes"), "entry": p, "bench_entry": b,
             "bench": BENCH.get(l.get("kind")),
             "status": "open" if p else "untracked", "cp": {}, "mfe": 0.0, "mae": 0.0, "last": p, "last_at": None})
         if slot: s["leads"][-1].update(slot=slot, entry_lag_min=lag)
+        if l.get("alerted"): s["leads"][-1]["model_alerted"] = True
         if p and _stale_quote(l, t):           # market closed: enter at the first live session price instead
             s["leads"][-1].update(entry=None, bench_entry=None, last=None, status="untracked", await_session=True, prior_close=p)
             p = None
@@ -797,7 +800,7 @@ def paper():
     wins = sum(1 for l in closed if l["paper"].get("pnl_pct", 0) > 0)
     took = [l for l in s["leads"] if l.get("decision") == "took"]; skip = [l for l in s["leads"] if l.get("decision") == "skipped"]
     lines = [f"Paper portfolio: {len(closed)} closed (win {wins}/{len(closed)}), book P/L {book:+.2f}%, {len(openp)} open, {len(wait)} awaiting entry, {len(nf)} never filled",
-             f"Your decisions: took {len(took)}, skipped {len(skip)}, no answer {sum(1 for l in s['leads'] if l.get('alerted') and not l.get('decision'))}"]
+             f"Your decisions: took {len(took)}, skipped {len(skip)}, no answer {sum(1 for l in s['leads'] if l.get('alerted') and not l.get('decision') and not l.get('superseded_by_alert'))}"]
     for l in openp: lines.append(f"- {l['asset']} open, mark {l['paper'].get('mark', 0):+.1%}")
     for l in sorted(closed, key=lambda l: l["paper"].get("closed_at", ""))[-5:]: lines.append(f"- {l['asset']} {l['paper'].get('exit_reason')} {l['paper'].get('pnl_pct', 0):+.1%} ({l.get('decision') or 'no answer'})")
     print("\n".join(lines))
@@ -923,6 +926,7 @@ def shadow():
     """Live shadow-test scorecard: leads found since SHADOW_START, resolved at target / stop / horizon, net of costs."""
     L = load().get("leads", [])
     live = [l for l in L if str(l.get("first_seen", "")) >= SHADOW_START and l.get("direction") in ("long", "short")
+            and not l.get("superseded_by_alert")                         # its alert-time row stands in for it
             and _num(l.get("stop_pct")) > 0 and _num(l.get("target_pct")) > 0]
     done = [l for l in live if l.get("ev_outcome") in (0, 1)]
     out = {"start": SHADOW_START, "end": SHADOW_END, "leads_with_levels": len(live), "resolved": len(done),
