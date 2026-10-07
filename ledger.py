@@ -40,7 +40,9 @@ LEAD FIELDS: asset (e.g. "LDO"), kind ("crypto"|"stock"|"commodity"|"polymarket"
 crypto) or ticker (Yahoo symbol: stock e.g. MU, commodity future e.g. GC=F) or market_slug + outcome (Polymarket;
 price = that outcome's share price), score (0-10), components {catalyst,timing,asym,liq,cred},
 catalyst_type (listing|unlock|regulatory|earnings|flows|token_sale|macro|partnership|tech_upgrade|
-polymarket|other), direction ("long"|"short"|"watch"), thesis, handles [..], urls [..], alerted (bool)
+polymarket|other), direction ("long"|"short"|"watch"), lean ("long"|"short"|"none": the side a "watch" thesis
+favours; a watch with no lean is price-tracked but kept out of directional stats and calibration), thesis, handles [..],
+urls [..], alerted (bool)
 EV FIELDS (optional): p_win (0-1, chance the target is hit before the stop within horizon_days), target_pct, stop_pct
 (% move from entry, both positive), horizon_days (default 14), liq_usd (24h $ volume / market liquidity),
 instrument (spot|perp|shares|futures|etf|outcome_shares), funding_ann_pct (perps), ev_pct (the model's own EV).
@@ -258,8 +260,20 @@ def _pm_levels(l):
         l["stop_pct_model"] = s; l["levels_clamped"] = True
         l["stop_pct"] = round(smax, 2)
 
+def _tdir(l):
+    """Side the lead is scored on: long/short as given; a "watch" uses its lean; None = no testable side."""
+    d = str(l.get("direction") or "").strip().lower()
+    d = {"buy": "long", "sell": "short"}.get(d, d)
+    if d in ("long", "short"): return d
+    lean = str(l.get("lean") or "").strip().lower()
+    return lean if lean in ("long", "short") else None
+
+def _sign(l):
+    return -1 if _tdir(l) == "short" else 1
+
 def _ev(l):
     p, t, st = _num(l.get("p_win")), _num(l.get("target_pct")), _num(l.get("stop_pct"))
+    if _tdir(l) is None: return None
     if not (0 < p < 1 and t > 0 and st > 0): return None
     hz = _num(l.get("horizon_days")) or 14
     return round(100 * (p * t / 100 - (1 - p) * st / 100 - _cost_rt(l, days=hz)), 2)
@@ -267,7 +281,7 @@ def _ev(l):
 # ---------- commands ----------
 LEAD_KEYS = ("asset", "kind", "cg_id", "ticker", "market_slug", "outcome", "score", "components", "catalyst_type",
              "direction", "thesis", "handles", "urls", "p_win", "target_pct", "stop_pct", "horizon_days", "liq_usd",
-             "instrument", "funding_ann_pct", "ev_pct", "regime", "family")
+             "instrument", "funding_ann_pct", "ev_pct", "regime", "family", "lean")
 
 def add(path):
     s = load(); new = json.load(open(path)); cp, sp = price_map(new)
@@ -313,7 +327,7 @@ def update():
     for l in open_:
         p, b = px(l, cp, sp)
         if p is None or not l.get("entry"): continue
-        sign = -1 if l.get("direction") == "short" else 1
+        sign = _sign(l)
         r = sign * (p / l["entry"] - 1)
         l["mfe"] = round(max(l.get("mfe", 0), r), 4); l["mae"] = round(min(l.get("mae", 0), r), 4)
         l["last"], l["last_at"] = p, t.isoformat(timespec="minutes")
@@ -334,7 +348,7 @@ def update():
 def _ev_track(l, r, age_d, t):
     """Record which of target / stop was reached first; resolve p_win at the first hit or at the horizon."""
     tg_, st = _num(l.get("target_pct")), _num(l.get("stop_pct"))
-    if not (0 < _num(l.get("p_win")) < 1 and tg_ > 0 and st > 0) or "ev_outcome" in l: return
+    if not (0 < _num(l.get("p_win")) < 1 and tg_ > 0 and st > 0) or "ev_outcome" in l or _tdir(l) is None: return
     iso = t.isoformat(timespec="minutes")
     if r <= -st / 100: l["ev_outcome"], l["ev_exit"], l["ev_how"] = 0, -st / 100, "stop"
     elif r >= tg_ / 100: l["ev_outcome"], l["ev_exit"], l["ev_how"] = 1, tg_ / 100, "target"
@@ -345,7 +359,7 @@ def _ev_track(l, r, age_d, t):
     l["ev_exit_net"] = round(l["ev_exit"] - _cost_rt(l, days=min(age_d, _num(l.get("horizon_days")) or 14)), 4)
 
 def _calib(L):
-    R = [l for l in L if l.get("ev_outcome") in (0, 1) and 0 < _num(l.get("p_win")) < 1]
+    R = [l for l in L if l.get("ev_outcome") in (0, 1) and 0 < _num(l.get("p_win")) < 1 and _tdir(l)]
     if not R: return {"n": 0}
     ps = [_num(l["p_win"]) for l in R]; os_ = [l["ev_outcome"] for l in R]
     base = sum(os_) / len(os_)
@@ -371,7 +385,10 @@ def _grp(rows, keyf, h="7d"):
                 "hit_rate": round(sum(1 for x in v if x > 0) / len(v), 2)} for k, v in sorted(g.items())}
 
 def stats():
-    s = load(); L = s["leads"]; out = {"leads_total": len(L), "open": sum(l["status"] == "open" for l in L)}
+    s = load(); L0 = s["leads"]; out = {"leads_total": len(L0), "open": sum(l["status"] == "open" for l in L0)}
+    L = [l for l in L0 if _tdir(l)]                    # a watch with no lean has no side to be right or wrong on
+    out["neutral_watch_excluded"] = len(L0) - len(L)
+    out["7d_by_direction"] = _grp(L0, lambda l: _tdir(l) or "watch_no_lean")
     for h in ("1d", "3d", "7d", "14d", "30d"):
         out[h] = {"by_score": _grp(L, lambda l: f"{int(l['score'] or 0)}", h),
                   "by_alerted": _grp(L, lambda l: "alerted" if l["alerted"] else "not_alerted", h)}
@@ -410,7 +427,7 @@ def brief():
     o = [l for l in L if l["status"] == "open"]
     lines = [f"Ledger: {len(L)} leads total, {len(o)} open, playbook {'set' if s.get('playbook') else 'empty'}"]
     for l in sorted(o, key=lambda l: l["first_seen"], reverse=True)[:12]:
-        r = (l["last"] / l["entry"] - 1) * (-1 if l.get("direction") == "short" else 1) if l.get("entry") and l.get("last") else None
+        r = (l["last"] / l["entry"] - 1) * _sign(l) if l.get("entry") and l.get("last") else None
         lines.append(f"- {l['asset']} s{l.get('score')}{' ALERTED' if l.get('alerted') else ''} since {l['first_seen'][:16]} "
                      f"now {r:+.1%}" if r is not None else f"- {l['asset']} s{l.get('score')} (no price)")
     a7 = [((l.get("cp") or {}).get("7d") or {}).get("excess") for l in L if l.get("alerted")]
@@ -927,7 +944,7 @@ def digest(send=False, if_due=False):
             a = _clip(m.get("asset"), 14)
             kb.append([{"text": f"👍 {a} useful", "callback_data": f"nm:{h}:u"}, {"text": f"👎 {a} noise", "callback_data": f"nm:{h}:d"}])
         s["nm_index"] = dict(list(idx.items())[-90:])
-    def ret(l): return (l["last"] / l["entry"] - 1) * (-1 if l.get("direction") == "short" else 1)
+    def ret(l): return (l["last"] / l["entry"] - 1) * _sign(l)
     o = [l for l in L if l.get("status") == "open" and l.get("entry") and l.get("last")]
     mv = sorted([l for l in o if abs(ret(l)) >= 0.005], key=lambda l: -abs(ret(l)))[:4]
     lines.append("Tracked leads, biggest moves since found: " + ", ".join(f"{l['asset']} {ret(l):+.1%}" for l in mv)
