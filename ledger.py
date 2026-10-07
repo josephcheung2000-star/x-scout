@@ -374,6 +374,29 @@ def _calib(L):
                                                                "hit": round(sum(o for _, o in b) / len(b), 2)}
     return out
 
+def _ikey(l):
+    """Instrument identity: the same coin / ticker / Polymarket outcome, whatever the model called the asset."""
+    k = l.get("kind") or "other"
+    if k == "polymarket" and l.get("market_slug"):
+        return f"pm:{l['market_slug']}|{str(l.get('outcome') or 'Yes').strip().lower()}"
+    if k == "crypto" and l.get("cg_id"): return f"cg:{str(l['cg_id']).lower()}"
+    if l.get("ticker"): return f"tk:{str(l['ticker']).upper()}"
+    return f"as:{str(l.get('asset') or '').strip().upper()}"
+
+def _stat_rows(L, since=None, overlap_days=7):
+    """Rows the learning stats may use: leads logged since the 2026-09-28 rule restart (SHADOW_START; override with
+    XS_STATS_SINCE), one per instrument per `overlap_days` (later rows on the same instrument overlap the first one's
+    7-day window and are not independent results). Returns (rows, info)."""
+    since = since or os.environ.get("XS_STATS_SINCE") or SHADOW_START
+    pre = [l for l in L if str(l.get("first_seen", "")) < since]
+    rows, kept = [], {}
+    for l in sorted((l for l in L if str(l.get("first_seen", "")) >= since), key=lambda l: l["first_seen"]):
+        k, t = _ikey(l), datetime.fromisoformat(l["first_seen"])
+        if k in kept and (t - kept[k]).total_seconds() < overlap_days * 86400: continue
+        kept[k] = t; rows.append(l)
+    return rows, {"since": since, "rows_all": len(L), "dropped_pre_since": len(pre),
+                  "dropped_overlap": len(L) - len(pre) - len(rows), "rows_used": len(rows)}
+
 def _grp(rows, keyf, h="7d"):
     g = {}
     for l in rows:
@@ -381,11 +404,13 @@ def _grp(rows, keyf, h="7d"):
         if not c or c.get("excess") is None: continue
         for k in (keyf(l) if isinstance(keyf(l), list) else [keyf(l)]):
             g.setdefault(str(k), []).append(c["excess"])
-    return {k: {"n": len(v), "mean_excess": round(statistics.mean(v), 4), "median_excess": round(statistics.median(v), 4),
+    clip = lambda v: [max(-1.0, min(1.0, x)) for x in v]       # Polymarket shares move +-100%+: cap so one market can't own a mean
+    return {k: {"n": len(v), "mean_excess": round(statistics.mean(clip(v)), 4), "median_excess": round(statistics.median(v), 4),
                 "hit_rate": round(sum(1 for x in v if x > 0) / len(v), 2)} for k, v in sorted(g.items())}
 
 def stats():
-    s = load(); L0 = s["leads"]; out = {"leads_total": len(L0), "open": sum(l["status"] == "open" for l in L0)}
+    s = load(); LA = s["leads"]; out = {"leads_total": len(LA), "open": sum(l["status"] == "open" for l in LA)}
+    L0, out["sample"] = _stat_rows(LA)
     L = [l for l in L0 if _tdir(l)]                    # a watch with no lean has no side to be right or wrong on
     out["neutral_watch_excluded"] = len(L0) - len(L)
     out["7d_by_direction"] = _grp(L0, lambda l: _tdir(l) or "watch_no_lean")
@@ -422,18 +447,28 @@ def set_playbook(path):
         s["playbook_history"] = s["playbook_history"][-20:]
     s["playbook"] = open(path).read().strip(); save(s); print("PLAYBOOK updated")
 
+def _past_horizon(l, t):
+    try: return (t - datetime.fromisoformat(l["first_seen"])).total_seconds() / 86400 >= (_num(l.get("horizon_days")) or 14)
+    except Exception: return False
+
 def brief():
     s = load(); L = s["leads"]; t = now()
-    o = [l for l in L if l["status"] == "open"]
-    lines = [f"Ledger: {len(L)} leads total, {len(o)} open, playbook {'set' if s.get('playbook') else 'empty'}"]
+    o = [l for l in L if l["status"] == "open" and not _past_horizon(l, t)]
+    ph = sum(1 for l in L if l["status"] == "open" and _past_horizon(l, t))
+    R, info = _stat_rows(L)
+    lines = [f"Ledger: {len(L)} leads total, {len(o)} live (within their horizon), {ph} past horizon (still priced to 30d), "
+             f"playbook {'set' if s.get('playbook') else 'empty'}",
+             f"Stats sample: {info['rows_used']} independent leads since {info['since'][:10]} "
+             f"({info['dropped_pre_since']} pre-restart and {info['dropped_overlap']} overlapping repeats excluded); "
+             f"with a 7d result: {sum(1 for l in R if ((l.get('cp') or {}).get('7d') or {}).get('excess') is not None)}"]
     for l in sorted(o, key=lambda l: l["first_seen"], reverse=True)[:12]:
         r = (l["last"] / l["entry"] - 1) * _sign(l) if l.get("entry") and l.get("last") else None
         lines.append(f"- {l['asset']} s{l.get('score')}{' ALERTED' if l.get('alerted') else ''} since {l['first_seen'][:16]} "
                      f"now {r:+.1%}" if r is not None else f"- {l['asset']} s{l.get('score')} (no price)")
-    a7 = [((l.get("cp") or {}).get("7d") or {}).get("excess") for l in L if l.get("alerted")]
+    a7 = [((l.get("cp") or {}).get("7d") or {}).get("excess") for l in R if l.get("alerted")]
     a7 = [x for x in a7 if x is not None]
     if a7: lines.append(f"Alert track record: n={len(a7)} 7d median excess {statistics.median(a7):+.1%}, hit {sum(x>0 for x in a7)/len(a7):.0%}")
-    c = _calib(L)
+    c = _calib(R)
     lines.append(f"Probability calibration: n={c['n']} resolved, you said {c['mean_p']:.0%} on average, actual hit {c['hit_rate']:.0%}, "
                  f"Brier {c['brier']} (base-rate guess {c['brier_if_base_rate']}); mean EV {c['mean_ev_net_pct']:+.1f}% vs realized {c['mean_realized_net_pct']:+.1f}%"
                  if c["n"] else "Probability calibration: no resolved p_win leads yet")
@@ -769,7 +804,7 @@ def handles(save_it=False):
 def handle_scores(K=5):
     """Per-account 7d track record, shrunk toward the all-lead average with K pseudo-results, and a weight for scoring."""
     s = load(); rows = []
-    for l in s.get("leads", []):
+    for l in _stat_rows(s.get("leads", []))[0]:
         ex = ((l.get("cp") or {}).get("7d") or {}).get("excess") if isinstance(l.get("cp"), dict) else None
         if isinstance(ex, (int, float)): rows.append((l, ex))
     if not rows: print("Handle track records: no 7-day results yet - every account has weight 0"); return
@@ -815,7 +850,8 @@ def shadow():
     done = [l for l in live if l.get("ev_outcome") in (0, 1)]
     out = {"start": SHADOW_START, "end": SHADOW_END, "leads_with_levels": len(live), "resolved": len(done),
            "ALERTS": _book_stats([l for l in done if l.get("alerted")]),
-           "LEADS6": _book_stats([l for l in done if _num(l.get("max_score") or l.get("score")) >= 6])}
+           "LEADS6": _book_stats([l for l in done if _num(l.get("score")) >= 6])}   # score when logged: a later
+    # re-mention's higher score was given after the price had moved, so max_score would select on the outcome
     a = out["ALERTS"]; prim = a if a.get("n", 0) >= 10 else out["LEADS6"]
     crit = {"mean_net_gt_0": prim.get("mean_net_pct", -1) > 0,
             "totalR_gt_0_and_dd_lt_10R": prim.get("total_R", -1) > 0 and prim.get("max_dd_R", 99) < 10,
@@ -957,7 +993,7 @@ def digest(send=False, if_due=False):
                and (t - fs).total_seconds() / 86400 - _num(v.get("age_d")) < 1:
                 new_cp.append(f"{l.get('asset')} {k} {v['excess']:+.1%}")
     if new_cp: lines.append("Results today (vs benchmark): " + ", ".join(new_cp[:6]))
-    a7 = [((l.get("cp") or {}).get("7d") or {}).get("excess") for l in L if l.get("alerted")]
+    a7 = [((l.get("cp") or {}).get("7d") or {}).get("excess") for l in _stat_rows(L)[0] if l.get("alerted")]
     a7 = [x for x in a7 if x is not None]
     lines.append(f"Alert track record: n={len(a7)}, 7d median excess {statistics.median(a7):+.1%}, hit {sum(x > 0 for x in a7)/len(a7):.0%}"
                  if a7 else "Alert track record: no 7-day results yet")
@@ -990,11 +1026,11 @@ def digest(send=False, if_due=False):
                  (("crypto", "crypto"), ("stock", "stocks"), ("commodity", "commodities"), ("polymarket", "Polymarket")) if _num(mn.get(k))]
         lines.append(f"Miss log ({ms.get('days')}d): flagged {int(_num(mc.get('all')))}/{int(_num(mn.get('all')))} big moves beforehand "
                      f"({', '.join(parts)})" + (f" | score>=7 leads that then moved: {ms.get('precision_hits')}/{ms.get('precision_n')}" if ms.get("precision_n") else ""))
-    c = _calib(L)
+    c = _calib(_stat_rows(L)[0])
     if c["n"]: lines.append(f"Calibration: {c['n']} resolved, predicted {c['mean_p']:.0%} vs actual {c['hit_rate']:.0%} (Brier {c['brier']})")
     fb = [f for f in s.get("feedback", []) if isinstance(f, dict)]
     if fb: lines.append(f"Your near-miss feedback so far: 👍 {sum(f.get('vote') == 'useful' for f in fb)} / 👎 {sum(f.get('vote') == 'noise' for f in fb)}")
-    lines.append(f"Ledger {len(L)} leads ({sum(l.get('status') == 'open' for l in L)} open) | playbook {'active' if s.get('playbook') else 'empty (learning)'}")
+    lines.append(f"Ledger {len(L)} leads ({sum(l.get('status') == 'open' and not _past_horizon(l, t) for l in L)} within horizon) | playbook {'active' if s.get('playbook') else 'empty (learning)'}")
     text = "\n".join(lines); print(text)
     if send or if_due:
         try:
