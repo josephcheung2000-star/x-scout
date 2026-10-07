@@ -23,7 +23,7 @@ SCORING RULES FROM PRIORS (pre-registered: only n>=20 and CI excluding 0; +-2 on
 - bithumb_krw_listing: -2 to a LONG idea resting on this catalyst (Bithumb KRW listing: drifts down - avoid long / short).
 - token_unlock: -2 to a LONG idea resting on this catalyst (Big cliff unlock (entered 7d before): drifts down - avoid long / short).
 - commodity_shock_up: -1 to a LONG idea resting on this catalyst (Commodity up-shock: fades - do not chase).
-- polymarket_big_move_up: -2 to an idea that buys in the direction of the jump (Polymarket 15-pt jump up: mean-reverts - fade the move).
+- polymarket_big_move_up: -2 to an idea that buys in the direction of the jump (the jump mean-reverts from the signal price, but fading it from a realistic entry 3h later lost money after costs in an independent test on 2026-10-07: n=5,752, mean -2.8%; do not fade either).
 - Listing catalysts do not stack: apply the single largest listing penalty once per coin (Upbit+Bithumb same day = -2, not -4).
 - binance_new_listing (playbook_v1): -2 to a LONG idea whose only catalyst is a listing / HODLer airdrop.
 - All other types: 0 (no adjustment; CI spans 0 or n<20). Replace priors once live ledger n>=8 per type at 7d.

@@ -581,7 +581,7 @@ def note_for(name, s, weak):
     L = LABEL.get(name, name); pre = "Weak sample: " if weak else ""
     if sign == 0: return pre + f"{L}: no edge (CI spans 0), score neutral"
     if name.startswith("polymarket_big_move"):
-        return pre + f"{L}: {'continues - follow the move' if sign > 0 else 'mean-reverts - fade the move'}"
+        return pre + f"{L}: {'continues - follow the move' if sign > 0 else 'mean-reverts from the signal price, but fading from a realistic entry 3h later lost money after spread and fees (independent test 2026-10-07: n=5,752, mean -2.8%) - do not chase and do not fade'}"
     if name == "stock_big_move_down" or name == "commodity_shock_down":
         return pre + f"{L}: {'keeps falling - do not catch the knife' if sign < 0 else 'rebounds - reversal long'}"
     if name in ("stock_big_move_up", "commodity_shock_up"):

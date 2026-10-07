@@ -468,7 +468,7 @@
    },
    "events_found": 133,
    "weak": false,
-   "note": "Polymarket 15-pt jump up: mean-reverts - fade the move",
+   "note": "Polymarket 15-pt jump up: mean-reverts from the signal price, but fading from a realistic entry 3h later lost money after spread and fees (independent test 2026-10-07: n=5,752 trades / 1,622 events, mean -2.8%, CI -4.8% to -0.6%) - do not chase and do not fade",
    "halves_median": [
     -0.09,
     -0.104
