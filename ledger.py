@@ -288,15 +288,18 @@ def add(path):
     t = now(); added = merged = 0
     for l in new:
         key = (l.get("asset") or "").upper()
-        recent = [x for x in s["leads"] if x["asset"].upper() == key and x["status"] in ("open", "untracked")
+        p, b = px(l, cp, sp)
+        # merge only a re-mention of the SAME instrument (cg_id / ticker / Polymarket slug+outcome, not the free-text
+        # asset name) on the SAME side; a flipped view or another market outcome is a new lead
+        ik, side = _ikey(l), _tdir(l) or "watch"
+        recent = [x for x in s["leads"] if _ikey(x) == ik and (_tdir(x) or "watch") == side and x["status"] in ("open", "untracked")
                   and (t - datetime.fromisoformat(x["first_seen"])).total_seconds() < 72 * 3600]
         if recent:
             x = recent[0]
-            x.setdefault("mentions", []).append({"at": t.isoformat(timespec="minutes"), "score": l.get("score"),
+            x.setdefault("mentions", []).append({"at": t.isoformat(timespec="minutes"), "score": l.get("score"), "px": p,
                                                   "alerted": bool(l.get("alerted")), "handles": l.get("handles", [])})
             x["max_score"] = max(_num(x.get("max_score") or x.get("score")), _num(l.get("score")))
             x["alerted"] = x["alerted"] or bool(l.get("alerted")); merged += 1; continue
-        p, b = px(l, cp, sp)
         s["leads"].append({**{k: l.get(k) for k in LEAD_KEYS if l.get(k) is not None},
             "score": _num(l.get("score")),
             "id": f"{key}-{t.strftime('%Y%m%d%H%M')}", "alerted": bool(l.get("alerted")), "max_score": _num(l.get("score")),
@@ -392,7 +395,8 @@ def _stat_rows(L, since=None, overlap_days=7):
     rows, kept = [], {}
     for l in sorted((l for l in L if str(l.get("first_seen", "")) >= since), key=lambda l: l["first_seen"]):
         k, t = _ikey(l), datetime.fromisoformat(l["first_seen"])
-        if k in kept and (t - kept[k]).total_seconds() < overlap_days * 86400: continue
+        if l.get("superseded_by_alert"): continue                       # its alert-time row stands in for it
+        if k in kept and (t - kept[k]).total_seconds() < overlap_days * 86400 and not l.get("alerted"): continue
         kept[k] = t; rows.append(l)
     return rows, {"since": since, "rows_all": len(L), "dropped_pre_since": len(pre),
                   "dropped_overlap": len(L) - len(pre) - len(rows), "rows_used": len(rows)}
@@ -532,10 +536,14 @@ def send_alert(path, asset, plan_path):
     s = load(); key = asset.upper()
     cands = [l for l in s["leads"] if l["asset"].upper() == key and l["status"] in ("open", "untracked")]
     if not cands: print(f"SEND-ALERT: no open lead {asset} - run ledger.py add first"); sys.exit(1)
+    try: want = _tdir({"direction": (json.load(open(plan_path)) or {}).get("direction")})
+    except Exception: want = None
+    cands = [l for l in cands if want and _tdir(l) == want] or cands     # the lead on the alert's side, if any
     l = max(cands, key=lambda l: l["first_seen"])
     text = open(path).read() if os.path.exists(path) else ""
     chunks = _chunks(text)
     if not chunks: print("SEND-ALERT: alert text is empty - nothing sent"); sys.exit(1)
+    l = _alert_row(s, l)
     try: plan = _valid_plan(json.load(open(plan_path)))
     except Exception: plan = None
     sent = 0
@@ -560,6 +568,31 @@ def send_alert(path, asset, plan_path):
     save(s)
     print(f"SEND-ALERT: sent {sent}/{len(chunks)} message(s) for {l['id']}; {msg}" + (" - PARTIAL, lead still marked alerted" if sent < len(chunks) else ""))
     if sent < len(chunks): sys.exit(2)
+
+ALERT_ROW_MAX_AGE_H = 6
+
+def _alert_row(s, l):
+    """An alert on a lead first logged > 6 h ago (a merged re-mention) must be scored from the alert-time price, not
+    from the first sighting: otherwise the move before the alert is credited to the alert. Start a fresh row."""
+    t = now()
+    age_h = (t - datetime.fromisoformat(l["first_seen"])).total_seconds() / 3600
+    if age_h <= ALERT_ROW_MAX_AGE_H: return l
+    try:
+        cp, sp = price_map([l]); p, b = px(l, cp, sp)
+    except Exception:
+        p = b = None
+    if not p:
+        l["alert_entry_stale_h"] = round(age_h, 1); return l
+    nl = {k: l[k] for k in LEAD_KEYS if k in l}
+    nl.update(score=l.get("score"), max_score=l.get("max_score"), bench=l.get("bench"), alert_of=l["id"],
+              id=f"{str(l['asset']).upper()}-{t.strftime('%Y%m%d%H%M')}A", alerted=False, first_seen=t.isoformat(timespec="minutes"),
+              entry=p, bench_entry=b, status="open", cp={}, mfe=0.0, mae=0.0, last=p, last_at=None)
+    for k in ("target_pct", "stop_pct"):                               # levels the model gave, not a clamped copy
+        if l.get(k + "_model") is not None: nl[k] = l[k + "_model"]
+    if "_pm_levels" in globals(): _pm_levels(nl)
+    nl["ev_net_pct"] = _ev(nl)
+    l["superseded_by_alert"] = nl["id"]; s["leads"].append(nl)
+    return nl
 
 def poll_replies():
     s = load(); off = s.get("tg_offset", 0); n = 0
