@@ -203,7 +203,8 @@ def main():
     hot = {t["ent"] for t in trig if t["type"] == "x_cluster"}
     for p in posts:
         if set(p.get("_ents", [])) & hot and p.get("id"): focus.add(p["id"])
-    sweep = 8 <= JST.hour <= 10
+    try: sweep = int(os.environ["XS_SLOT_HOUR"]) == 8          # the pipeline passes the slot being prepared
+    except Exception: sweep = 8 <= JST.hour <= 10                # (a feeder-dispatched prep runs ~07:40 JST for 08:45)
     mode = "full" if (trig or sweep) else "light"
     top = sorted(posts, key=lambda p: -num((p.get("m") or {}).get("views") if isinstance(p.get("m"), dict) else 0))[:40]
     focus |= {p["id"] for p in top if p.get("id")}

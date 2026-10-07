@@ -20,7 +20,8 @@ FOLDER = os.environ.get("XS_FOLDER", "11yC1KUtWZTUYoZIEuU_AoT8bFhomq6qo")   # Dr
 JST = datetime.timezone(datetime.timedelta(hours=9))
 SLOT_HOURS = [2, 5, 8, 11, 14, 17, 20, 23]            # Claude runs at HH:45 JST
 PREP_WINDOW = (3, 45)                                  # prep between 45 and 3 minutes before the slot
-PART_CHARS = 12000                                     # the Claude run's Drive reader truncates long docs; keep parts small
+PART_CHARS = 4000                                      # UTF-8 bytes per XS-IN part. The Claude run's Drive reader cut parts
+                                                       # of ~6-7 KB (2026-10-06); 4 KB leaves room for its export overhead
 HEALTH = "health.json"                                 # committed by the workflow: once-per-day notice memory
 ERRORS = []
 SLOT_RX = re.compile(r"\d{4}-\d{2}-\d{2} \d{4}")
@@ -53,12 +54,25 @@ def drive():
     return build("drive", "v3", credentials=Credentials.from_authorized_user_info(info), cache_discovery=False)
 
 
+def _x(req, tries=4):
+    """execute() a Drive request, retrying rate limits / 5xx / network errors: an uncaught Drive error fails the
+    whole job (and, mid-prep, leaves a partial XS-IN with the ledger update never pushed)."""
+    for i in range(tries):
+        try:
+            return req.execute()
+        except Exception as e:
+            code = getattr(getattr(e, "resp", None), "status", None)
+            if i == tries - 1 or (code is not None and int(code) not in (403, 429, 500, 502, 503, 504)):
+                raise
+            time.sleep(5 * 2 ** i)
+
+
 def list_files(d, contains, extra=""):
     q = f"'{FOLDER}' in parents and name contains '{contains}' and trashed = false {extra}"
     out, tok = [], None
     while True:
-        r = d.files().list(q=q, orderBy="createdTime", pageSize=100, pageToken=tok,
-                           fields="nextPageToken, files(id,name,mimeType,createdTime)").execute()
+        r = _x(d.files().list(q=q, orderBy="createdTime", pageSize=100, pageToken=tok,
+                              fields="nextPageToken, files(id,name,mimeType,createdTime)"))
         out += r.get("files", [])
         tok = r.get("nextPageToken")
         if not tok:
@@ -75,12 +89,12 @@ def read_file(d, f):
 
 def create_doc(d, title, text):
     body = {"name": title, "parents": [FOLDER], "mimeType": "application/vnd.google-apps.document"}
-    return d.files().create(body=body, media_body=MediaInMemoryUpload(text.encode("utf-8"), mimetype="text/plain"),
-                            fields="id").execute()["id"]
+    return _x(d.files().create(body=body, media_body=MediaInMemoryUpload(text.encode("utf-8"), mimetype="text/plain"),
+                               fields="id"))["id"]
 
 
 def rename(d, f, new):
-    d.files().update(fileId=f["id"], body={"name": new}).execute()
+    _x(d.files().update(fileId=f["id"], body={"name": new}))
 
 
 def sh(args, timeout=900, env_extra=None):
@@ -188,13 +202,22 @@ def prep(d, slot):
             notify("other", "no X posts from the Mac feeder for 12+ hours - is the Mac asleep or offline")
     print(f"x: ok={x.get('ok')} files={len(files)} kept={len(posts_all)}")
 
-    rc, out = sh(["sources.py", "3.5"], timeout=300)
+    # source window = time since the last prep + 30 min (preps drift between 3 and ~70 min before a slot, so a fixed
+    # 3.5 h window can leave gaps of up to an hour that no run ever sees); triage de-duplicates repeats by key
+    win = 3.5
+    try:
+        lp = (load_json("state.json", {}) or {}).get("last_prep_at")
+        if lp:
+            win = min(12.0, max(3.5, (datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromisoformat(lp)).total_seconds() / 3600 + 0.5))
+    except Exception:
+        pass
+    rc, out = sh(["sources.py", f"{win:.2f}"], timeout=300)
     src = load_json("sources.json", {})
     counts = {k: len(v) for k, v in src.items() if isinstance(v, list)}
     src_errs = [f"{it.get('src')}: {one_line(it.get('error'), 80)}" for v in src.values() if isinstance(v, list)
                 for it in v if isinstance(it, dict) and "error" in it]
     counts = {k: sum(1 for it in src.get(k, []) if isinstance(it, dict) and "error" not in it) for k in counts}
-    rc, out = sh(["sources2.py", "3.5"], timeout=240)
+    rc, out = sh(["sources2.py", f"{win:.2f}"], timeout=240)
     s2 = load_json("sources2.json", {})
     if not isinstance(s2, dict) or "counts" not in s2:
         s2 = {}
@@ -202,7 +225,7 @@ def prep(d, slot):
     for k, v in (s2.get("counts") or {}).items():
         counts[k] = v
     src_errs += [f"s2 {one_line(e, 90)}" for e in (s2.get("errors") or [])][:8]
-    rc, out = sh(["triage.py"], timeout=300)
+    rc, out = sh(["triage.py"], timeout=300, env_extra={"XS_SLOT_HOUR": str(slot.hour)})   # sweep = the 08:45 slot, not the wall clock
     tri = load_json("triage.json", {"mode": "full", "triggers": [], "focus_ids": [], "read_all_posts": True})
     # second-tier triggers: each event key counts once per TRIG_TTL_DAYS; any new one makes this a full run
     st = load_json("state.json", None)
@@ -253,6 +276,7 @@ def prep(d, slot):
                                  "sources": counts, "source_errors": src_errs, "mode": tri.get("mode"),
                                  "prep_errors": list(ERRORS)}
         s["pending_prep"] = dict(sorted(pend.items())[-12:])
+        s["last_prep_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="minutes")
         json.dump(s, open("state.json", "w"), ensure_ascii=False, indent=1)
 
     # ------------- build the input document
@@ -300,15 +324,7 @@ def prep(d, slot):
                      f"{one_line(p.get('text'), 700)} | {p.get('url')}")
     L += ["", "END OF INPUT"]
     text = "\n".join(L)
-    parts, cur = [], ""
-    blen = lambda s: len(s.encode("utf-8"))                   # the reader truncates by size, and CJK text is 3 bytes/char
-    for line in L:                                             # split on line boundaries, never mid-post
-        while blen(line) > PART_CHARS - 200:
-            line = line[:-50]
-        if cur and blen(cur) + blen(line) + 1 > PART_CHARS:
-            parts.append(cur); cur = ""
-        cur += line + "\n"
-    parts.append(cur)
+    parts = split_parts(L)
     for i, part in enumerate(parts):
         title = name if len(parts) == 1 else f"{name} part {i + 1} of {len(parts)}"
         create_doc(d, title, part + f"--- END OF PART {i + 1} OF {len(parts)} ---\n")
@@ -324,6 +340,21 @@ def prep(d, slot):
         err("ledger push after prep failed")
         return False
     return True
+
+
+def split_parts(lines, limit=None):
+    """Split the input lines into parts of at most `limit` UTF-8 bytes (+ the end marker), on line boundaries."""
+    limit = limit or PART_CHARS
+    parts, cur = [], ""
+    blen = lambda s: len(s.encode("utf-8"))                   # the reader truncates by size, and CJK text is 3 bytes/char
+    for line in lines:                                         # split on line boundaries, never mid-post
+        while blen(line) > limit - 200:
+            line = line[:-50]
+        if cur and blen(cur) + blen(line) + 1 > limit:
+            parts.append(cur); cur = ""
+        cur += line + "\n"
+    parts.append(cur)
+    return parts
 
 
 def priors_text():
@@ -560,9 +591,10 @@ def main():
     slot = next_slot(now)
     mins = (slot - now).total_seconds() / 60
     want_prep = mode == "prep" or (mode in ("tick", "need-prep") and PREP_WINDOW[0] <= mins <= PREP_WINDOW[1])
-    if want_prep and mode != "prep":
+    if want_prep and not os.environ.get("XS_FORCE_PREP"):
         if list_files(d, "XS-IN " + slot_name(slot)):
-            want_prep = False                              # already prepared for this slot
+            want_prep = False                              # already prepared for this slot (a second set of parts
+                                                           # for one slot lets the Claude run mix parts of two builds)
     if mode == "need-prep":                                # workflow asks first, so Chromium is installed only when needed
         print("yes" if want_prep else "no")
         return
