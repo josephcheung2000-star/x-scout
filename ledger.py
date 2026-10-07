@@ -40,11 +40,12 @@ LEAD FIELDS: asset (e.g. "LDO"), kind ("crypto"|"stock"|"commodity"|"polymarket"
 crypto) or ticker (Yahoo symbol: stock e.g. MU, commodity future e.g. GC=F) or market_slug + outcome (Polymarket;
 price = that outcome's share price), score (0-10), components {catalyst,timing,asym,liq,cred},
 catalyst_type (listing|unlock|regulatory|earnings|flows|token_sale|macro|partnership|tech_upgrade|
-polymarket|other), direction ("long"|"short"|"watch"), lean ("long"|"short"|"none": the side a "watch" thesis
-favours; a watch with no lean is price-tracked but kept out of directional stats and calibration), thesis, handles [..],
-urls [..], alerted (bool)
+polymarket|other), direction ("long"|"short"|"watch"), lean ("up"|"down"|"none", also "long"|"short": the side a
+"watch" thesis favours; a watch with no lean is price-tracked but kept out of directional stats and calibration),
+thesis, handles [..], urls [..], alerted (bool). Unknown fields are ignored.
 EV FIELDS (optional): p_win (0-1, chance the target is hit before the stop within horizon_days), target_pct, stop_pct
-(% move from entry, both positive), horizon_days (default 14), liq_usd (24h $ volume / market liquidity),
+(% move from entry, both positive), target_price / stop_price (Polymarket only: share prices in (0, 1); when valid
+they win over target_pct / stop_pct, which are recomputed from the actual entry), horizon_days (default 14), liq_usd (24h $ volume / market liquidity),
 instrument (spot|perp|shares|futures|etf|outcome_shares), funding_ann_pct (perps), ev_pct (the model's own EV).
 The ledger recomputes ev_net_pct = p*target - (1-p)*stop - round-trip costs, records which of target/stop was hit
 first (3-hourly price samples; same sample = stop), and scores calibration (Brier) once resolved.
@@ -250,11 +251,29 @@ def _cost_rt(l, plan=None, days=0.0, entry=None):
 
 PM_TOP, PM_BOTTOM = 0.99, 0.01      # a share at >=0.99 / <=0.01 is treated as resolved
 
+def _pm_price_levels(l, e):
+    """Polymarket target_price / stop_price (share prices) -> target_pct / stop_pct measured from the actual entry `e`.
+    A valid price field wins over the pct field (the given pct is kept as *_pct_given); an invalid one (outside (0, 1)
+    or on the wrong side of the entry) is ignored and noted, and the pct field stands."""
+    sign = -1 if _tdir(l) == "short" else 1
+    for name, f in (("target", lambda v: sign * (v / e - 1)), ("stop", lambda v: sign * (1 - v / e))):
+        v = l.get(name + "_price")
+        if v is None: continue
+        try: v = float(v)
+        except Exception: v = None
+        pct = 100 * f(v) if v is not None and 0 < v < 1 else None
+        if pct is None or pct <= 0:
+            l.setdefault("levels_note", []).append(f"{name}_price {l.get(name + '_price')} ignored (entry {e:.3f})"); continue
+        if l.get(name + "_pct") is not None and round(_num(l.get(name + "_pct")), 2) != round(pct, 2):
+            l[name + "_pct_given"] = l.get(name + "_pct")
+        l[name + "_pct"] = round(pct, 2); l["levels_from"] = "price"
+
 def _pm_levels(l):
     """Polymarket target/stop are % moves of a share bounded in [0, 1]. Clamp them to what the share can reach
     (resolution at ~1 or ~0) so a won/lost market resolves the race instead of timing out as a miss."""
     e = _num(l.get("entry"))
     if l.get("kind") != "polymarket" or not (0 < e < 1): return
+    _pm_price_levels(l, e)
     tmax, smax = 100 * (PM_TOP / e - 1), 100 * (1 - PM_BOTTOM / e)
     t, s = _num(l.get("target_pct")), _num(l.get("stop_pct"))
     if t > 0 and t > tmax:
@@ -271,6 +290,7 @@ def _tdir(l):
     d = {"buy": "long", "sell": "short"}.get(d, d)
     if d in ("long", "short"): return d
     lean = str(l.get("lean") or "").strip().lower()
+    lean = {"up": "long", "down": "short", "buy": "long", "sell": "short", "bull": "long", "bear": "short"}.get(lean, lean)
     return lean if lean in ("long", "short") else None
 
 def _sign(l):
@@ -293,7 +313,7 @@ def _ev(l):
 # ---------- commands ----------
 LEAD_KEYS = ("asset", "kind", "cg_id", "ticker", "market_slug", "outcome", "score", "components", "catalyst_type",
              "direction", "thesis", "handles", "urls", "p_win", "target_pct", "stop_pct", "horizon_days", "liq_usd",
-             "instrument", "funding_ann_pct", "ev_pct", "regime", "family", "lean")
+             "instrument", "funding_ann_pct", "ev_pct", "regime", "family", "lean", "target_price", "stop_price")
 
 def add(path, slot=None):
     s = load(); new = json.load(open(path)); cp, sp = price_map(new)
