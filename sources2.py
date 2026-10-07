@@ -7,9 +7,14 @@ Usage: python3 sources2.py [hours=3.5]
 KEYS
   coinbase_new     Advanced Trade SPOT products new_at in window or not yet seen (+ status RSS: Markets Open /
                    full trading / Auction / Suspension in window)
-  upbit_krw_new    KRW market set diff vs seen; kind new | removed | warning_on | caution_on
-  bithumb_krw_new  same for Bithumb (market_warning CAUTION = 투자유의 = warning_on)
-  bithumb_notices  feed-api notices in window (the feed returns the latest 5 only)
+  upbit_krw_new    KRW market set diff vs seen; kind new | removed | warning_on/off | caution_on/off
+                   (market/all?is_details=true: market_event.warning, market_event.caution.{PRICE_FLUCTUATIONS,
+                   TRADING_VOLUME_SOARING, DEPOSIT_AMOUNT_SOARING, GLOBAL_PRICE_DIFFERENCES, CONCENTRATION_OF_SMALL_ACCOUNTS})
+  bithumb_krw_new  same for Bithumb (market_warning CAUTION = 투자유의 = warning_on/off)
+  bithumb_notices  feed-api notices in window (the feed returns the latest 5 only); "events" = parsed title events
+  bithumb_wallet   public/assetsstatus/ALL diff vs seen: deposit or withdrawal suspended (wallet_suspend) / resumed
+  upbit_notices    Upbit announcements (unofficial api-manager endpoint, often Cloudflare-blocked: then a note, not an
+                   error); title events as for bithumb_notices
   unlocks_14d      DefiLlama cliff unlocks in the next 14 days, per protocol per UTC day; kept if >= 1% of
                    DefiLlama unlocked supply or >= $10M (price: CoinGecko /simple/price, fallback coins.llama.fi)
   governance       Snapshot proposals created <= 48h or active, space >= 1000 followers, buyback / fee switch /
@@ -38,7 +43,12 @@ TRIGGERS (key is stable per event)
   etf_flow              |z| >= 2.5                                                etf_flow:<btc|eth>:<date>
   polymarket_new        new market (<= 48h), liquidity >= $100k, not sports / daily strike   polymarket_new:<slug>
   polymarket_mispricing overround flag, not sports, and (event not neg-risk-augmented, or best-ask sum < 1 or
-                        best-bid sum > 1)                                         polymarket_mispricing:<event slug>"""
+                        best-bid sum > 1)                                         polymarket_mispricing:<event slug>
+  exchange_flag         Korean exchange flag/notice for an asset: Upbit caution / warning ON or OFF, Bithumb investment
+                        warning designated / lifted, Bithumb/Upbit deposit-withdrawal suspended / resumed, delisting
+                        notice                                   krw_flag:<upbit|bithumb>:<event>:<ASSET>
+                        (event: warning_on|warning_off|caution_on|caution_off|wallet_suspend|wallet_resume|delisting;
+                        flag diff and notice share the key, so each fires once per 7 days per asset)"""
 import json, os, re, sys, time, math, html, statistics, urllib.request, urllib.parse
 import concurrent.futures as cf
 from datetime import datetime, timezone, timedelta
@@ -53,6 +63,7 @@ UA = "Mozilla/5.0 (compatible; x-scout-research/1.0)"
 BUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 SF, CAP = "state.json", 5000
 ERRORS = []
+NOTES = []                                # soft failures of unofficial endpoints: reported, never an error line
 
 def get(url, data=None, ua=UA, ct=None, raw=False):
     h = {"User-Agent": ua, "Accept": "application/json, text/html;q=0.9, */*;q=0.8"}
@@ -176,21 +187,33 @@ def krw_diff(ex, rows, flags):
     NEW_SEEN[f"{ex}_krw_live"] = set(cur)
     for fk, ms in flags.items():
         pf = baseline(f"{ex}_{fk}")
+        if ms is None:                                     # the detail fields were missing: no diff, keep the old set
+            continue
+        if pf and len(pf) >= 5 and not ms:
+            err(f"{ex}_{fk}", ValueError(f"all {len(pf)} {fk} flags vanished at once; diff skipped")); continue
         if pf is not None:
-            for m in sorted(ms - pf):
-                out.append({"src": ex, "id": f"{m}:{fk}_on", "title": f"{ex.capitalize()} {fk} flag ON {m} ({rows.get(m)})",
-                            "at": iso(NOW), "url": url(m), "kind": f"{fk}_on", "market": m, "name": rows.get(m),
-                            "delisting_risk": fk == "warning"})
+            for m, on in [(m, True) for m in sorted(ms - pf)] + [(m, False) for m in sorted((pf - ms) & cur)]:
+                ev_ = f"{fk}_{'on' if on else 'off'}"
+                out.append({"src": ex, "id": f"{m}:{ev_}", "title": f"{ex.capitalize()} {fk} flag {'ON' if on else 'OFF'} {m} ({rows.get(m)})",
+                            "at": iso(NOW), "url": url(m), "kind": ev_, "market": m, "name": rows.get(m),
+                            "delisting_risk": fk == "warning" and on})
+                trig.append(flag_trigger(ex, ev_, m.split("-")[1], f"{ex.capitalize()} {fk} flag {'ON' if on else 'OFF'} {m} ({rows.get(m)})", url(m)))
         NEW_SEEN[f"{ex}_{fk}"] = set(ms)                   # current set, so a re-flag fires again
     return out, trig
 
+def flag_trigger(ex, event, asset, what, url):
+    """One key per exchange + event + asset: the flag diff and the exchange notice of the same event share it."""
+    return {"type": "exchange_flag", "key": f"krw_flag:{ex}:{event}:{asset.upper()}", "asset": asset.upper(),
+            "event": event, "what": what, "url": url}
+
 def upbit_krw_new():
     try:
-        d = [m for m in get("https://api.upbit.com/v1/market/all?isDetails=true") if m["market"].startswith("KRW-")]
+        d = [m for m in get("https://api.upbit.com/v1/market/all?is_details=true") if m["market"].startswith("KRW-")]
         rows = {m["market"]: m.get("english_name") for m in d}
         ev = lambda m: m.get("market_event") or {}
-        flags = {"warning": {m["market"] for m in d if ev(m).get("warning") or m.get("market_warning") == "CAUTION"},
-                 "caution": {m["market"] for m in d if any((ev(m).get("caution") or {}).values())}}
+        detailed = any("market_event" in m or "market_warning" in m for m in d)
+        flags = {"warning": {m["market"] for m in d if ev(m).get("warning") or m.get("market_warning") == "CAUTION"} if detailed else None,
+                 "caution": {m["market"] for m in d if any((ev(m).get("caution") or {}).values())} if detailed else None}
         return krw_diff("upbit", rows, flags)
     except Exception as e:
         err("upbit_krw", e); return [], []
@@ -199,22 +222,109 @@ def bithumb_krw_new():
     try:
         d = [m for m in get("https://api.bithumb.com/v1/market/all?isDetails=true") if m["market"].startswith("KRW-")]
         rows = {m["market"]: m.get("english_name") for m in d}
-        return krw_diff("bithumb", rows, {"warning": {m["market"] for m in d if m.get("market_warning") not in (None, "NONE")}})
+        detailed = any("market_warning" in m for m in d)
+        return krw_diff("bithumb", rows, {"warning": {m["market"] for m in d if m.get("market_warning") not in (None, "NONE")} if detailed else None})
     except Exception as e:
         err("bithumb_krw", e); return [], []
 
-# ---------------------------------------------------------------- 3 bithumb notices
+# ---------------------------------------------------------------- 3 bithumb / upbit notices
+# title -> events; the first matching rule per group wins (an "off" wording is tested before the "on" wording)
+NOTICE_RULES = [
+    ("warning_off", re.compile(r"(유의\s*종목|투자\s*유의|거래\s*유의|주의\s*종목).{0,30}해제|"
+                               r"(?i:(warning|caution) (designation )?(lifted|removed|released)|release of .{0,20}(warning|caution))")),
+    ("warning_on", re.compile(r"(투자\s*유의|거래\s*유의|유의)\s*(종목\s*)?(지정|촉구)|(?i:investment warning|designated as .{0,20}(caution|warning))")),
+    ("caution_on", re.compile(r"주의\s*종목\s*지정|(?i:caution (designation|flag))")),
+    ("wallet_resume", re.compile(r"(입출금|입금|출금).{0,30}(재개|(중지|중단)\s*해제)|(?i:(deposits?|withdrawals?).{0,30}(resum|reopen|re-open))")),
+    ("wallet_suspend", re.compile(r"(입출금|입금|출금)\s*(서비스\s*)?(일시\s*)?(중지|중단)|(?i:(deposits?|withdrawals?).{0,30}suspen)")),
+    ("delisting", re.compile(r"거래\s*지원\s*종료|상장\s*폐지|(?i:delist|end of trading support|termination of trading support)")),
+]
+GROUPS = (("warning_off", "warning_on", "caution_on"), ("wallet_resume", "wallet_suspend"), ("delisting",))
+TICKER_RX = re.compile(r"\(([A-Z0-9]{2,12})\)")
+
+def notice_events(title):
+    """[(event, ASSET)] for an exchange notice title such as '자이(XAI) 거래유의종목 지정' or
+    '아이오텍스(IOTX) 입출금 일시 중지 안내'. Assets are the upper-case tickers in parentheses."""
+    title = str(title or "")
+    assets = [a for a in TICKER_RX.findall(title) if a not in ("KRW", "BTC", "USDT")] or \
+             [a for a in TICKER_RX.findall(title)]
+    rules = dict(NOTICE_RULES)
+    evs = []
+    for g in GROUPS:
+        hit = next((e for e in g if rules[e].search(title)), None)
+        if hit: evs.append(hit)
+    return [(e, a) for e in evs for a in dict.fromkeys(assets)]
+
+def _notice_items(ex, rows):
+    out, trig = [], []
+    for n in rows:
+        evs = notice_events(n["title"])
+        out.append({**n, "events": [f"{e}:{a}" for e, a in evs]} if evs else n)
+        for e, a in evs:
+            trig.append(flag_trigger(ex, e, a, f"{ex.capitalize()} notice: {n['title']}", n.get("url")))
+    return out, trig
+
 def bithumb_notices():
-    out = []
+    rows = []
     try:
         for n in get("https://feed-api.bithumb.com/v1/notices", ua=BUA):
             at = iso(datetime.fromisoformat(n["published_at"]).replace(tzinfo=SEOUL))
             if not in_window(at): continue
-            out.append({"src": "bithumb_notice", "id": str(n["pc_url"]).rsplit("/", 1)[-1], "title": n["title"], "at": at,
-                        "url": n["pc_url"], "category": ",".join(n.get("categories") or [])})
+            rows.append({"src": "bithumb_notice", "id": str(n["pc_url"]).rsplit("/", 1)[-1], "title": n["title"], "at": at,
+                         "url": n["pc_url"], "category": ",".join(n.get("categories") or [])})
     except Exception as e:
         err("bithumb_notices", e)
-    return out, []
+    return _notice_items("bithumb", rows)
+
+def upbit_notices():
+    """Upbit announcements. The api-manager endpoint is unofficial and sits behind Cloudflare (blocked from some cloud
+    IPs): any failure or unexpected shape is a NOTE, never an error, and yields nothing."""
+    rows = []
+    try:
+        d = get("https://api-manager.upbit.com/api/v1/announcements?os=web&page=1&per_page=20&category=all", ua=BUA)
+        notices = ((d or {}).get("data") or {}).get("notices") if isinstance(d, dict) else None
+        if not isinstance(notices, list):
+            NOTES.append("upbit_notices: unexpected response shape"); return [], []
+        for n in notices:
+            if not isinstance(n, dict) or not n.get("title"): continue
+            ts = n.get("listed_at") or n.get("first_listed_at") or n.get("created_at")
+            try: at = iso(parse_iso(ts) if parse_iso(ts).tzinfo else parse_iso(ts).replace(tzinfo=SEOUL))
+            except Exception: continue
+            if not in_window(at): continue
+            nid = str(n.get("id") or "")
+            rows.append({"src": "upbit_notice", "id": nid, "title": n["title"], "at": at, "category": n.get("category"),
+                         "url": f"https://upbit.com/service_center/notice?id={nid}"})
+    except Exception as e:
+        NOTES.append(f"upbit_notices: {type(e).__name__} {str(e)[:60]}"); return [], []
+    return _notice_items("upbit", rows)
+
+def bithumb_wallet():
+    """Deposit/withdrawal status per asset (public, no key). An asset whose deposits or withdrawals switch off is
+    wallet_suspend; back on is wallet_resume. First run seeds silently; a mass flip (>= 30% of assets) is a glitch."""
+    out, trig = [], []
+    try:
+        d = get("https://api.bithumb.com/public/assetsstatus/ALL")
+        data = d.get("data") if isinstance(d, dict) and str(d.get("status")) == "0000" else None
+        if not isinstance(data, dict) or len(data) < 50:
+            raise ValueError(f"unexpected assetsstatus response ({len(data) if isinstance(data, dict) else 'no data'})")
+        cur = {a.upper() for a, v in data.items() if isinstance(v, dict)}
+        off = {a.upper() for a, v in data.items() if isinstance(v, dict) and
+               (str(v.get("deposit_status")) == "0" or str(v.get("withdrawal_status")) == "0")}
+        prev = baseline("bithumb_wallet_off")
+        if prev is not None:
+            on_, back = sorted(off - prev), sorted((prev - off) & cur)
+            if len(on_) + len(back) >= 0.3 * len(cur):
+                raise ValueError(f"{len(on_) + len(back)} of {len(cur)} wallets flipped at once; diff skipped")
+            for a, ev_ in [(a, "wallet_suspend") for a in on_] + [(a, "wallet_resume") for a in back]:
+                v = data.get(a) or data.get(a.lower()) or {}
+                what = (f"Bithumb {a} deposits/withdrawals {'suspended' if ev_ == 'wallet_suspend' else 'resumed'} "
+                        f"(deposit {'on' if str(v.get('deposit_status')) == '1' else 'off'}, withdrawal {'on' if str(v.get('withdrawal_status')) == '1' else 'off'})")
+                u = f"https://www.bithumb.com/react/trade/order/{a}-KRW"
+                out.append({"src": "bithumb", "id": f"{a}:{ev_}", "title": what, "at": iso(NOW), "url": u, "kind": ev_, "asset": a})
+                trig.append(flag_trigger("bithumb", ev_, a, what, u))
+        NEW_SEEN["bithumb_wallet_off"] = off
+    except Exception as e:
+        err("bithumb_wallet", e)
+    return out, trig
 
 # ---------------------------------------------------------------- 4 unlocks
 LL = "https://defillama-datasets.llama.fi/"
@@ -649,7 +759,7 @@ def polymarket_extra():
 
 # ---------------------------------------------------------------- main
 SOURCES = [unlocks_14d, polymarket_extra, commodities, coinbase_new, upbit_krw_new, bithumb_krw_new, bithumb_notices,
-           governance, etf_flows, insider_buys, stock_movers, regime]
+           bithumb_wallet, upbit_notices, governance, etf_flows, insider_buys, stock_movers, regime]
 
 def save_state():
     if STATE is None or not NEW_SEEN: return
@@ -668,7 +778,7 @@ def save_state():
         err("state", e)
 
 def main():
-    res = {"at": iso(NOW), "window_h": H, "errors": ERRORS, "counts": {}, "triggers": []}
+    res = {"at": iso(NOW), "window_h": H, "errors": ERRORS, "notes": NOTES, "counts": {}, "triggers": []}
     if STATE is None:
         ERRORS.append("state: state.json missing or not a dict; no diffs, nothing saved")
     ex = cf.ThreadPoolExecutor(len(SOURCES))

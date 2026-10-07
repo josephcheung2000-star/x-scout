@@ -27,8 +27,8 @@ ERRORS = []
 SLOT_RX = re.compile(r"\d{4}-\d{2}-\d{2} \d{4}")
 TRIG_TTL_DAYS = 7                                      # a second-tier trigger key re-fires only after this many days
 S2_PER_KEY = 10                                        # second-tier items shown per source in the input doc
-S2_KEYS = ["coinbase_new", "upbit_krw_new", "bithumb_krw_new", "bithumb_notices", "unlocks_14d", "governance", "etf_flows",
-           "insider_buys", "stock_movers", "commodities", "polymarket_extra"]
+S2_KEYS = ["coinbase_new", "upbit_krw_new", "bithumb_krw_new", "bithumb_notices", "bithumb_wallet", "upbit_notices",
+           "unlocks_14d", "governance", "etf_flows", "insider_buys", "stock_movers", "commodities", "polymarket_extra"]
 S2_DROP = {"src", "id", "at", "url", "title", "rule", "recipients", "description"}
 
 
