@@ -60,6 +60,10 @@ Ledger and stats
   close; holding periods run from the actual entry.
 - 08 An account gets a +1/-1 weight only with at least 8 results and a Wilson bound clear of the base rate; only the
   accounts behind a lead when it was first logged are credited.
+- 17 A lead counts as alerted only once its alert was actually delivered (send-alert). The model's own "alerted" flag
+  is kept for reference only, so an alert the pipeline blocked starts no 14-day cooldown and stays out of the alert
+  stats. The shadow scorecard and the paper "no answer" count skip rows replaced by an alert-time row.
+- 20 The LEDGER STATS section starts with the same "Stats sample: N independent leads since ..." line as the brief.
 - 15 Leads may carry `lean` as "up" / "down" / "none" (or long / short), and Polymarket leads may carry share-price
   levels `target_price` and `stop_price` next to `target_pct` / `stop_pct`. When valid, the share prices win and the %
   levels are recomputed from the actual entry; impossible prices are ignored and noted. Unknown fields are still ignored (the
@@ -73,7 +77,7 @@ Pipeline
   that slot does nothing. Just before writing, prep checks Drive again and, if the slot's XS-IN appeared meanwhile,
   writes nothing and gives back the triggers it would have used. A forced rebuild (`XS_FORCE_PREP`) keeps the first
   build's full mode, re-reads the posts the first build consumed, and still sees that slot's own triggers.
-- 10 Korean exchange events are triggers (once per 7 days per asset and event): Upbit caution / warning flag on and
+- 10 Korean exchange events are triggers (once per 7 days per asset and event; which of them force a full run: see 19): Upbit caution / warning flag on and
   off, Bithumb investment-warning designation and lifting, Bithumb deposit/withdrawal suspension and resumption (new
   public status feed), and the same events in Bithumb (and, when reachable, Upbit) notice titles.
 - 11 Second-tier lists no longer hide what matters: every exchange flag / notice / wallet change, every unlock of 2% or
@@ -81,8 +85,20 @@ Pipeline
   ones left out. The input doc may run to more 4 KB parts.
 - 12 Old XS-IN / XS-OUT files are moved to the Drive subfolder "X-scout archive" after 7 days and trashed only after
   60 days (they were trashed after 7, which destroyed audit evidence). Raw XS-POSTS files are still trashed after 7 days.
+- 18 Input parts are uploaded under a temporary name ("XS-BUILDING ...") and renamed to "XS-IN ..." only when all parts
+  exist. A slot counts as prepared only if its input is complete, so a prep that failed half-way is rebuilt by the next
+  tick instead of blocking the slot. A manual run can force a rebuild (workflow input force_prep); the older parts are
+  renamed "SUPERSEDED ...".
+- 19 Korean exchange events no longer all force a full run. Only a new warning designation, a delisting notice or an
+  unscheduled deposit/withdrawal suspension does (a suspension announced as maintenance, a network upgrade or for a set
+  time does not), and at most 5 of them per prep. All other exchange events are still listed in the input.
+- 21 Smaller fixes: a Drive permission error is no longer retried (rate limits still are); a Drive upload that may have
+  landed is checked by name before it is sent again, so no duplicate part; a Polymarket level of exactly 1.0 or 0.0
+  ("hold to resolution") is treated as 0.99 / 0.01 rather than blocking the alert; the input doc shows the real source
+  window; labels such as "(ERC20)" in exchange notices are not taken for coin tickers.
 - 13 Polymarket alert backstop: an alert is blocked (logged as a near-miss) when the side bought moved 8 points or
-  more against the trade in the past 24 hours, or when its target or stop as a share price is outside 0.01-0.99. If the
+  more against the trade in the past 24 hours, or when its target or stop as a share price is outside 0.01-0.99 (see 21
+  for levels of exactly 1.0 / 0.0). If the
   price data cannot be fetched, the alert is not blocked. (The rule against mid-priced bets anchored on an outside
   forecast stays in the prompt: it cannot be checked by code.)
 
