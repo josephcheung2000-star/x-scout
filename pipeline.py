@@ -62,17 +62,35 @@ def drive():
     return build("drive", "v3", credentials=Credentials.from_authorized_user_info(info), cache_discovery=False)
 
 
-def _x(req, tries=4):
+RATE_403 = re.compile(r"(?i)rateLimitExceeded|userRateLimitExceeded|sharingRateLimitExceeded|quotaExceeded")
+
+
+def _retryable(e):
+    """Rate limits, 5xx and network errors are retried; a 403 only when it is a rate limit (a permission 403 is not)."""
+    code = getattr(getattr(e, "resp", None), "status", None)
+    if code is None:
+        return True                                    # network / timeout
+    code = int(code)
+    if code == 403:
+        return bool(RATE_403.search(str(getattr(e, "content", b"") or b"") + " " + str(e)))
+    return code in (429, 500, 502, 503, 504)
+
+
+def _x(req, tries=4, before_retry=None):
     """execute() a Drive request, retrying rate limits / 5xx / network errors: an uncaught Drive error fails the
-    whole job (and, mid-prep, leaves a partial XS-IN with the ledger update never pushed)."""
+    whole job (and, mid-prep, leaves a partial XS-IN with the ledger update never pushed). A non-idempotent request
+    passes `before_retry`: called after a failure, it returns the result if the first attempt did land after all."""
     for i in range(tries):
         try:
             return req.execute()
         except Exception as e:
-            code = getattr(getattr(e, "resp", None), "status", None)
-            if i == tries - 1 or (code is not None and int(code) not in (403, 429, 500, 502, 503, 504)):
+            if i == tries - 1 or not _retryable(e):
                 raise
             time.sleep(5 * 2 ** i)
+            if before_retry:
+                done = before_retry()
+                if done is not None:
+                    return done
 
 
 def list_files(d, contains, extra="", parent=None):
@@ -97,8 +115,14 @@ def read_file(d, f):
 
 def create_doc(d, title, text):
     body = {"name": title, "parents": [FOLDER], "mimeType": "application/vnd.google-apps.document"}
+    def landed():                                      # an ambiguous failure may have created the file: never twice
+        try:
+            hit = [f for f in list_files(d, title) if f.get("name") == title]
+        except Exception:
+            return None
+        return {"id": hit[-1]["id"]} if hit else None
     return _x(d.files().create(body=body, media_body=MediaInMemoryUpload(text.encode("utf-8"), mimetype="text/plain"),
-                               fields="id"))["id"]
+                               fields="id"), before_retry=landed)["id"]
 
 
 def rename(d, f, new):
@@ -342,7 +366,7 @@ def prep(d, slot):
     if full:
         L += ["=== EDGAR FILINGS TO REVIEW ==="] + [json.dumps(t, ensure_ascii=False) for t in tri.get("edgar_review", [])] + [""]
         L += ["=== ENTITY COUNTS (accounts naming each asset) ===", json.dumps(tri.get("entity_counts", {}), ensure_ascii=False), ""]
-        L += ["=== PRIMARY SOURCES (last 3.5h) ==="]
+        L += [f"=== PRIMARY SOURCES (last {win:.1f}h) ==="]
         for k in ("binance", "okx", "polymarket", "hyperliquid"):
             for it in src.get(k, []):
                 if isinstance(it, dict) and "error" not in it:
@@ -615,6 +639,9 @@ def pm_block(lead, plan, d):
         t, st = _f(lead.get("target_pct")), _f(lead.get("stop_pct"))
         if lv["target"] is None and t: lv["target"] = e * (1 + sign * t / 100)
         if lv["stop"] is None and st: lv["stop"] = e * (1 - sign * st / 100)
+    for k, v in lv.items():                            # a level AT resolution (1.0 / 0.0) means "hold to resolution":
+        if v is not None and abs(v - 1.0) < 1e-9: lv[k] = PM_HI     # clamp it to the reachable 0.99 / 0.01
+        elif v is not None and abs(v) < 1e-9: lv[k] = PM_LO
     bad = [f"{k} {v:.3f}" for k, v in lv.items() if v is not None and not (PM_LO <= v <= PM_HI)]
     if bad:
         return f"Polymarket {' and '.join(bad)} outside the reachable share range [{PM_LO}, {PM_HI}]"

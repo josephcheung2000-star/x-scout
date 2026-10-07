@@ -250,13 +250,14 @@ NOTICE_RULES = [
 ]
 GROUPS = (("warning_off", "warning_on", "caution_on"), ("wallet_resume", "wallet_suspend"), ("delisting",))
 TICKER_RX = re.compile(r"\(([A-Z0-9]{2,12})\)")
+NOT_TICKER = re.compile(r"^((ERC|BEP|TRC|BRC|ARC|HRC|KIP|SRC|ZRC)-?\d+|KRW|USD)$")   # token standards (ERC20 ...), market labels
 
 def notice_events(title):
     """[(event, ASSET)] for an exchange notice title such as '자이(XAI) 거래유의종목 지정' or
     '아이오텍스(IOTX) 입출금 일시 중지 안내'. Assets are the upper-case tickers in parentheses."""
     title = str(title or "")
-    assets = [a for a in TICKER_RX.findall(title) if a not in ("KRW", "BTC", "USDT")] or \
-             [a for a in TICKER_RX.findall(title)]
+    found = [a for a in TICKER_RX.findall(title) if not NOT_TICKER.match(a)]
+    assets = [a for a in found if a not in ("BTC", "USDT")] or found
     rules = dict(NOTICE_RULES)
     evs = []
     for g in GROUPS:
